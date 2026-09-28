@@ -69,9 +69,14 @@ begleq-cascade doctor 203.0.113.10 2053
 
 Ставит `iptables-persistent` и `conntrack`, поднимает `nf_conntrack_max` и срезает
 таймаут established (дефолтные 65 536 и 5 суток переполняют таблицу на релее),
-включает `ip_forward` через `/etc/sysctl.d`, добавляет разрешающее правило
-в `FORWARD`, сбрасывает conntrack при смене выхода и предупреждает, если
-входящий порт уже занят.
+включает `ip_forward` через `/etc/sysctl.d`, прописывает `nf_conntrack` и `tcp_bbr`
+в автозагрузку модулей (иначе параметры conntrack после ребута не применятся),
+добавляет в `FORWARD` разрешающие правила в обе стороны, сбрасывает conntrack
+при смене выхода, убирает ставшие ненужными правила `FORWARD` и предупреждает,
+если входящий порт (TCP или UDP) уже занят.
+
+Если на сервере стоит `ufw`, `iptables-persistent` не ставится — пакеты
+конфликтуют, и apt удалил бы ufw. Правила в этом случае не переживут ребут.
 
 ## Файлы
 
@@ -79,4 +84,6 @@ begleq-cascade doctor 203.0.113.10 2053
 |---|---|
 | `/etc/begleq-cascade/routes.db` | имена маршрутов |
 | `/etc/sysctl.d/99-begleq-cascade.conf` | conntrack, forwarding, BBR |
+| `/etc/modules-load.d/begleq-cascade.conf` | загрузка `nf_conntrack`, `tcp_bbr` при старте |
+| `/etc/modprobe.d/begleq-cascade.conf` | `hashsize` для conntrack |
 | `/etc/iptables/rules.v4` | сохранённые правила |
