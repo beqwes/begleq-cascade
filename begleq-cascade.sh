@@ -7,13 +7,20 @@
 
 set -o pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 SYSCTL_FILE="/etc/sysctl.d/99-begleq-cascade.conf"
 MODULES_FILE="/etc/modules-load.d/begleq-cascade.conf"
 MODPROBE_FILE="/etc/modprobe.d/begleq-cascade.conf"
 LOCK_FILE="/run/begleq-cascade.lock"
+LIB_BIN="/usr/local/lib/begleq-cascade/begleq-cascade"   # копия для юнита
+UNIT_NAME="begleq-cascade.service"
+UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
+
+# Метка на всех правилах скрипта: list/del/replace-hop/sync трогают только их.
+TAG="begleq-cascade"
+CMT=(-m comment --comment "$TAG")
 
 NO_PERSIST=0        # 1 — add_route не сохраняет правила сам (пакетные операции)
 DROPPED_DESTS=()    # заполняет drop_existing_dnat: ip:port снятых DNAT
@@ -45,6 +52,14 @@ acquire_lock() {
 
 default_iface() {
     ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
+}
+
+# Интерфейс, через который реально уходит трафик к выходу (может быть не
+# дефолтным — например, туннель).
+route_iface() {  # ip
+    local dev
+    dev=$(ip route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
+    echo "${dev:-$(default_iface)}"
 }
 
 valid_ip() {
@@ -85,15 +100,28 @@ check_route_args() {  # proto in_port target_ip target_port [name]
 # ip_forward: пишем в sysctl.d, а не в sysctl.conf.
 # Грабля: `grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf` совпадает с
 # ЗАКОММЕНТИРОВАННОЙ строкой, проверка проходит, форвардинг после ребута выключен.
+# nf_conntrack_max по объёму памяти: запись занимает ~320 байт, таблице
+# отдаём не больше 1/16 RAM. 512 МБ → 131072, 2 ГБ → ~420k, потолок 1M.
+conntrack_limit() {
+    local mem_kb max
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+    max=$(( ${mem_kb:-0} * 1024 / 16 / 320 ))
+    (( max < 131072 )) && max=131072
+    (( max > 1048576 )) && max=1048576
+    echo "$max"
+}
+
 apply_sysctl() {
     hdr "Системные параметры (conntrack, forwarding, BBR)"
-    cat > "$SYSCTL_FILE" <<'EOF'
+    local ct_max; ct_max=$(conntrack_limit)
+    local ct_hash=$(( ct_max / 4 ))
+    cat > "$SYSCTL_FILE" <<EOF
 # begleq-cascade — параметры релей-ноды
 net.ipv4.ip_forward=1
 
 # Дефолты ядра (max 65536, established 432000 = 5 суток) переполняют
 # таблицу conntrack на релее. Симптом: ICMP идёт, а TCP молча дропается.
-net.netfilter.nf_conntrack_max=524288
+net.netfilter.nf_conntrack_max=$ct_max
 net.netfilter.nf_conntrack_tcp_timeout_established=3600
 net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
 net.netfilter.nf_conntrack_tcp_timeout_close_wait=30
@@ -110,7 +138,7 @@ nf_conntrack
 tcp_bbr
 EOF
     # hashsize задаётся не через sysctl, а параметром модуля.
-    echo "options nf_conntrack hashsize=131072" > "$MODPROBE_FILE"
+    echo "options nf_conntrack hashsize=$ct_hash" > "$MODPROBE_FILE"
 
     modprobe nf_conntrack 2>/dev/null
     modprobe tcp_bbr 2>/dev/null
@@ -121,7 +149,7 @@ EOF
     fi
 
     if [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
-        echo 131072 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null
+        echo "$ct_hash" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null
     fi
 
     ok "ip_forward = $(sysctl -n net.ipv4.ip_forward 2>/dev/null)"
@@ -133,41 +161,71 @@ pkg_installed() {
     dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
 }
 
+# iptables-persistent больше не ставим: он конфликтует с ufw (apt снёс бы ufw),
+# а `netfilter-persistent save` с docker сохраняет его динамические правила,
+# и после ребута они задваиваются. Маршруты восстанавливает свой юнит.
 install_deps() {
-    local need=() p skipped=0
-    for p in iptables-persistent netfilter-persistent conntrack; do
+    local need=() p
+    for p in iptables conntrack; do
         pkg_installed "$p" || need+=("$p")
     done
-    # iptables-persistent конфликтует с ufw: apt -y молча снесёт ufw.
-    if pkg_installed ufw && [[ " ${need[*]} " == *" iptables-persistent "* ]]; then
-        warn "Установлен ufw — iptables-persistent его удалит, поэтому НЕ ставлю."
-        warn "Правила не переживут ребут. Если ufw не нужен: apt install iptables-persistent"
-        need=("${need[@]/iptables-persistent}"); need=("${need[@]/netfilter-persistent}")
-        read -r -a need <<< "${need[*]}"
-        skipped=1
-    fi
     if (( ${#need[@]} )); then
         hdr "Установка зависимостей: ${need[*]}"
         export DEBIAN_FRONTEND=noninteractive
-        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
         apt-get update -qq >/dev/null 2>&1
         if ! apt-get install -y -qq "${need[@]}" >/dev/null 2>&1; then
-            warn "Не все пакеты установились — правила могут не пережить ребут."
+            warn "Не все пакеты установились: ${need[*]}"
             return 1
         fi
     fi
-    (( skipped )) && return 1
     ok "Зависимости на месте"
+}
+
+# systemd-юнит, который при загрузке вызывает `sync` и поднимает маршруты
+# из routes.db. Юнит запускает копию скрипта — она не зависит от того,
+# откуда и как скачан исходный файл.
+install_boot_unit() {
+    command -v systemctl >/dev/null 2>&1 \
+        || { warn "Нет systemd — маршруты не восстановятся после ребута"; return 1; }
+    local self; self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
+    if [[ -f "$self" && "$self" != "$LIB_BIN" ]]; then
+        install -D -m 755 "$self" "$LIB_BIN"
+    fi
+    [[ -x "$LIB_BIN" ]] \
+        || { warn "Не удалось сохранить копию скрипта в $LIB_BIN"; return 1; }
+
+    local unit
+    unit=$(cat <<EOF
+[Unit]
+Description=begleq-cascade: восстановление DNAT-маршрутов
+Wants=network-online.target
+After=network-online.target netfilter-persistent.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$LIB_BIN sync --boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+    if [[ "$(cat "$UNIT_FILE" 2>/dev/null)" != "$unit" ]]; then
+        printf '%s\n' "$unit" > "$UNIT_FILE"
+        systemctl daemon-reload
+    fi
+    systemctl is-enabled --quiet "$UNIT_NAME" 2>/dev/null \
+        || systemctl enable --quiet "$UNIT_NAME" 2>/dev/null \
+        || { warn "Не удалось включить $UNIT_NAME"; return 1; }
 }
 
 persist_rules() {
     (( NO_PERSIST )) && return 0
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save >/dev/null 2>&1 && ok "Правила сохранены (переживут ребут)" \
-            || warn "netfilter-persistent save не отработал"
-    else
-        warn "netfilter-persistent не установлен — правила потеряются после ребута"
+    install_boot_unit && ok "Маршруты восстановятся после ребута ($UNIT_NAME)"
+    # Если rules.v4 ведёт netfilter-persistent, держим его актуальным —
+    # кроме хостов с docker (см. install_deps).
+    if command -v netfilter-persistent >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || warn "netfilter-persistent save не отработал"
     fi
 }
 
@@ -192,38 +250,108 @@ db_del() {  # proto in_port
     mv "$ROUTES_DB.tmp" "$ROUTES_DB"
 }
 
-# ip:port назначения из строки `iptables -S` с DNAT.
-dnat_dest() {
-    sed -n 's/.*--to-destination \([0-9.]*:[0-9]*\).*/\1/p' <<< "$1"
+# Поля из строки `iptables -S` с DNAT.
+dnat_proto() { sed -n 's/.*-p \([a-z]*\) .*/\1/p' <<< "$1"; }
+dnat_dport() { sed -n 's/.*--dport \([0-9]*\).*/\1/p' <<< "$1"; }
+dnat_dest()  { sed -n 's/.*--to-destination \([0-9.]*:[0-9]*\).*/\1/p' <<< "$1"; }
+
+# Правила begleq-cascade в цепочке (строки `iptables -S` с нашей меткой).
+tagged_rules() {  # table chain
+    iptables -t "$1" -S "$2" 2>/dev/null | grep -F -- "--comment $TAG"
 }
 
-# Снимает все DNAT с тем же протоколом и входящим портом (перезапись маршрута).
-# Снятые назначения складывает в DROPPED_DESTS — для чистки FORWARD.
+# Содержит ли правило все фрагменты. Пробел в конце строки и фрагментов —
+# граница слова: "--dport 44 " не совпадёт с "--dport 443".
+rule_has() {  # line frag...
+    local line="$1 " f; shift
+    for f; do [[ "$line" == *"$f"* ]] || return 1; done
+}
+
+# Снимает помеченные правила, содержащие все фрагменты.
+del_tagged() {  # table chain frag...
+    local t=$1 c=$2 line rules; shift 2
+    mapfile -t rules < <(tagged_rules "$t" "$c")
+    for line in "${rules[@]}"; do
+        rule_has "$line" "$@" || continue
+        # shellcheck disable=SC2086
+        iptables -t "$t" -D ${line#-A } 2>/dev/null
+    done
+}
+
+# Есть ли наш DNAT с точно таким назначением (и, если задан, входящим портом).
+dnat_exists() {  # proto ip:port [in_port]
+    local line frags=("-p $1 " "-j DNAT " "--to-destination $2 ")
+    [[ -n "${3:-}" ]] && frags+=("--dport $3 ")
+    while IFS= read -r line; do
+        rule_has "$line" "${frags[@]}" && return 0
+    done < <(tagged_rules nat PREROUTING)
+    return 1
+}
+
+# Снимает все DNAT с тем же протоколом и входящим портом — и чужие тоже:
+# два DNAT на один порт всё равно не работают, сработает первый.
+# Снятые назначения складывает в DROPPED_DESTS — для чистки FORWARD/MASQUERADE.
 drop_existing_dnat() {
     local proto=$1 in_port=$2 line rules
     DROPPED_DESTS=()
     # Сначала читаем цепочку целиком, потом правим — не меняем её на ходу.
     mapfile -t rules < <(iptables -t nat -S PREROUTING 2>/dev/null)
     for line in "${rules[@]}"; do
-        [[ "$line" == *"-j DNAT"* ]] || continue
-        [[ "$line" == *"-p $proto "* ]] || continue
-        [[ "$line" == *"--dport $in_port "* || "$line" == *"--dport $in_port" ]] || continue
+        rule_has "$line" "-j DNAT " "-p $proto " "--dport $in_port " || continue
+        [[ "$line" == *"--comment $TAG"* ]] \
+            || warn "Снимаю чужое DNAT-правило на том же порту: $line"
         # shellcheck disable=SC2086
         iptables -t nat -D ${line#-A } 2>/dev/null && DROPPED_DESTS+=("$(dnat_dest "$line")")
     done
 }
 
-# Разрешающее правило FORWARD для назначения больше не нужно, если на него
-# не ссылается ни один DNAT — снимаем, чтобы не копились мусорные ACCEPT.
-cleanup_forward() {  # proto ip:port
-    local proto=$1 dest=$2
-    [[ -n "$dest" ]] || return 0
-    if iptables -t nat -S PREROUTING 2>/dev/null \
-            | grep -F -- "-j DNAT" | grep -F -- "-p $proto " \
-            | grep -qE -- "--to-destination ${dest//./\\.}( |$)"; then
-        return 0
+# Ставит правила маршрута; каждое — только если его ещё нет (идемпотентно).
+apply_route_rules() {  # proto in_port target_ip target_port iface
+    local proto=$1 in_port=$2 tip=$3 tport=$4 iface=$5
+    local dnat=(-p "$proto" --dport "$in_port" "${CMT[@]}" -j DNAT --to-destination "$tip:$tport")
+    # MASQUERADE только для трафика к выходу, а не для всего интерфейса.
+    local masq=(-o "$iface" -p "$proto" -d "$tip" --dport "$tport" "${CMT[@]}" -j MASQUERADE)
+    local fwd=(-p "$proto" -d "$tip" --dport "$tport" "${CMT[@]}" -j ACCEPT)
+    # shellcheck disable=SC2054  # запятая — часть синтаксиса --ctstate
+    local est=(-m conntrack --ctstate ESTABLISHED,RELATED "${CMT[@]}" -j ACCEPT)
+
+    if ! iptables -t nat -C PREROUTING "${dnat[@]}" 2>/dev/null \
+            && ! iptables -t nat -A PREROUTING "${dnat[@]}"; then
+        err "Не удалось создать DNAT."
+        return 1
     fi
-    while iptables -D FORWARD -p "$proto" -d "${dest%:*}" --dport "${dest#*:}" -j ACCEPT 2>/dev/null; do :; done
+    if ! iptables -t nat -C POSTROUTING "${masq[@]}" 2>/dev/null; then
+        # Интерфейс мог смениться — старое правило для этого выхода убираем.
+        del_tagged nat POSTROUTING "-p $proto " "-d $tip/32 " "--dport $tport " "-j MASQUERADE "
+        if ! iptables -t nat -A POSTROUTING "${masq[@]}"; then
+            iptables -t nat -D PREROUTING "${dnat[@]}" 2>/dev/null
+            err "Не удалось создать MASQUERADE на $iface."
+            return 1
+        fi
+    fi
+    # FORWARD может стоять в policy DROP (например, из-за docker или ufw).
+    # Нужны оба направления: ACCEPT к выходу и ESTABLISHED для ответов,
+    # иначе ответные пакеты выхода → клиент дропнутся.
+    iptables -C FORWARD "${fwd[@]}" 2>/dev/null || iptables -I FORWARD 1 "${fwd[@]}"
+    iptables -C FORWARD "${est[@]}" 2>/dev/null || iptables -I FORWARD 1 "${est[@]}"
+    return 0
+}
+
+# Правила FORWARD/MASQUERADE для назначения больше не нужны, если на него
+# не ссылается ни один наш DNAT — снимаем, чтобы не копился мусор.
+cleanup_dest() {  # proto ip:port
+    local proto=$1 dest=$2 ip port
+    [[ -n "$dest" ]] || return 0
+    dnat_exists "$proto" "$dest" && return 0
+    ip=${dest%:*}; port=${dest#*:}
+    del_tagged filter FORWARD "-p $proto " "-d $ip/32 " "--dport $port " "-j ACCEPT "
+    del_tagged nat POSTROUTING "-p $proto " "-d $ip/32 " "--dport $port " "-j MASQUERADE "
+    # Правило версии 1.0 — без метки.
+    while iptables -D FORWARD -p "$proto" -d "$ip" --dport "$port" -j ACCEPT 2>/dev/null; do :; done
+    # ESTABLISHED нужен, пока жив хоть один маршрут.
+    if ! tagged_rules nat PREROUTING | grep -qF -- "-j DNAT"; then
+        del_tagged filter FORWARD "-m conntrack "
+    fi
 }
 
 # Сброс conntrack для порта — иначе живые сессии продолжат идти по старому DNAT.
@@ -237,10 +365,10 @@ flush_conntrack_port() {
 
 add_route() {  # proto in_port target_ip target_port [name]
     local proto=$1 in_port=$2 tip=$3 tport=$4 name=${5:-}
-    local iface; iface=$(default_iface)
 
     check_route_args "$proto" "$in_port" "$tip" "$tport" "$name" || return 1
-    [[ -n "$iface" ]] || { err "Не удалось определить внешний интерфейс."; return 1; }
+    local iface; iface=$(route_iface "$tip")
+    [[ -n "$iface" ]] || { err "Не удалось определить интерфейс до $tip."; return 1; }
 
     # Порт занят локальным сервисом? DNAT в PREROUTING перехватит трафик
     # раньше него — предупреждаем, чтобы не убить чужой сервис молча.
@@ -253,32 +381,11 @@ add_route() {  # proto in_port target_ip target_port [name]
 
     hdr "Маршрут: :$in_port/$proto → $tip:$tport (iface $iface)"
     drop_existing_dnat "$proto" "$in_port"
-    local old_dests=("${DROPPED_DESTS[@]}")
+    local old_dests=("${DROPPED_DESTS[@]}") d
 
-    if ! iptables -t nat -A PREROUTING -p "$proto" --dport "$in_port" \
-            -j DNAT --to-destination "$tip:$tport"; then
-        err "Не удалось создать DNAT."
-        return 1
-    fi
-    if ! iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE 2>/dev/null; then
-        if ! iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE; then
-            iptables -t nat -D PREROUTING -p "$proto" --dport "$in_port" \
-                -j DNAT --to-destination "$tip:$tport" 2>/dev/null
-            err "Не удалось создать MASQUERADE на $iface."
-            return 1
-        fi
-    fi
-    # FORWARD может стоять в policy DROP (например, из-за docker или ufw).
-    # Нужны оба направления: ACCEPT к выходу и ESTABLISHED для ответов,
-    # иначе ответные пакеты выхода → клиент дропнутся.
-    iptables -C FORWARD -p "$proto" -d "$tip" --dport "$tport" -j ACCEPT 2>/dev/null \
-        || iptables -I FORWARD 1 -p "$proto" -d "$tip" --dport "$tport" -j ACCEPT 2>/dev/null
-    iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
-        || iptables -I FORWARD 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-
-    local d
+    apply_route_rules "$proto" "$in_port" "$tip" "$tport" "$iface" || return 1
     for d in "${old_dests[@]}"; do
-        [[ "$d" == "$tip:$tport" ]] || cleanup_forward "$proto" "$d"
+        [[ "$d" == "$tip:$tport" ]] || cleanup_dest "$proto" "$d"
     done
 
     flush_conntrack_port "$proto" "$in_port"
@@ -297,47 +404,49 @@ del_route() {  # proto in_port
     if (( ${#DROPPED_DESTS[@]} == 0 )); then
         warn "DNAT для :$in_port/$proto не найден"
     fi
-    for d in "${DROPPED_DESTS[@]}"; do cleanup_forward "$proto" "$d"; done
+    for d in "${DROPPED_DESTS[@]}"; do cleanup_dest "$proto" "$d"; done
     flush_conntrack_port "$proto" "$in_port"
     db_del "$proto" "$in_port"
     persist_rules
     ok "Маршрут :$in_port/$proto удалён"
 }
 
+route_name() {  # proto in_port
+    awk -F'|' -v p="$1" -v d="$2" '$1==p && $2==d {print $5}' "$ROUTES_DB" 2>/dev/null
+}
+
 list_routes() {
     hdr "Активные маршруты (из iptables)"
-    local found=0 line proto dport dest
+    local found=0 line proto dport dest name foreign
     while IFS= read -r line; do
         [[ "$line" == *"-j DNAT"* ]] || continue
-        proto=$(sed -n 's/.*-p \([a-z]*\).*/\1/p' <<< "$line")
-        dport=$(sed -n 's/.*--dport \([0-9]*\).*/\1/p' <<< "$line")
-        dest=$(sed -n 's/.*--to-destination \([0-9.:]*\).*/\1/p' <<< "$line")
-        local name; name=$(awk -F'|' -v p="$proto" -v d="$dport" \
-            '$1==p && $2==d {print $5}' "$ROUTES_DB" 2>/dev/null)
+        proto=$(dnat_proto "$line"); dport=$(dnat_dport "$line"); dest=$(dnat_dest "$line")
+        name=$(route_name "$proto" "$dport")
         printf "  ${GREEN}:%-6s${NC} %-4s → ${CYAN}%-22s${NC} %s\n" \
             "$dport" "$proto" "$dest" "${name:+[$name]}"
         found=1
-    done < <(iptables -t nat -S PREROUTING 2>/dev/null)
+    done < <(tagged_rules nat PREROUTING)
     (( found )) || msg "  ${YELLOW}маршрутов нет${NC}"
+    foreign=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "-j DNAT" \
+        | grep -cvF -- "--comment $TAG")
+    (( foreign )) && msg "  (ещё DNAT-правил не от begleq-cascade: $foreign — не трогаю)"
+    return 0
 }
 
 replace_hop() {  # old_ip new_ip
-    local old=$1 new=$2 line proto dport oport name rules n=0
+    local old=$1 new=$2 line proto dport oport rules n=0
     valid_ip "$old" || { err "Некорректный старый IP"; return 1; }
     valid_ip "$new" || { err "Некорректный новый IP"; return 1; }
     hdr "Переключение выхода: $old → $new"
     # Снимок цепочки до изменений: add_route правит PREROUTING по ходу цикла.
-    mapfile -t rules < <(iptables -t nat -S PREROUTING 2>/dev/null)
+    mapfile -t rules < <(tagged_rules nat PREROUTING)
     NO_PERSIST=1
     for line in "${rules[@]}"; do
         # Точное совпадение IP: подстрока "$old:" ловила бы и 11.2.3.4 при old=1.2.3.4.
         [[ "$line" == *"-j DNAT"* && "$line" == *"--to-destination $old:"* ]] || continue
-        proto=$(sed -n 's/.*-p \([a-z]*\).*/\1/p' <<< "$line")
-        dport=$(sed -n 's/.*--dport \([0-9]*\).*/\1/p' <<< "$line")
+        proto=$(dnat_proto "$line"); dport=$(dnat_dport "$line")
         oport=${line##*--to-destination "$old":}; oport=${oport%% *}
-        name=$(awk -F'|' -v p="$proto" -v d="$dport" \
-            '$1==p && $2==d {print $5}' "$ROUTES_DB" 2>/dev/null)
-        add_route "$proto" "$dport" "$new" "$oport" "$name" && n=$((n+1))
+        add_route "$proto" "$dport" "$new" "$oport" "$(route_name "$proto" "$dport")" && n=$((n+1))
     done
     NO_PERSIST=0
     if (( n )); then
@@ -346,6 +455,71 @@ replace_hop() {  # old_ip new_ip
     else
         warn "Маршрутов с $old не найдено"
     fi
+}
+
+# v1.0 ставила правила без метки. Помечаем те, что совпадают с routes.db, —
+# дальше скрипт работает только с помеченными.
+migrate_legacy() {
+    [[ -s "$ROUTES_DB" ]] || return 0
+    local rules line proto in_port tip tport name iface n=0
+    mapfile -t rules < <(iptables -t nat -S PREROUTING 2>/dev/null)
+    while IFS='|' read -r proto in_port tip tport name; do
+        valid_proto "$proto" && valid_port "$in_port" && valid_ip "$tip" && valid_port "$tport" || continue
+        for line in "${rules[@]}"; do
+            [[ "$line" == *"--comment"* ]] && continue
+            rule_has "$line" "-j DNAT " "-p $proto " "--dport $in_port " "--to-destination $tip:$tport " || continue
+            iface=$(route_iface "$tip")
+            [[ -n "$iface" ]] || continue
+            # shellcheck disable=SC2086
+            iptables -t nat -D ${line#-A } 2>/dev/null
+            while iptables -D FORWARD -p "$proto" -d "$tip" --dport "$tport" -j ACCEPT 2>/dev/null; do :; done
+            apply_route_rules "$proto" "$in_port" "$tip" "$tport" "$iface" && n=$((n+1))
+        done
+    done < "$ROUTES_DB"
+    if (( n )); then
+        ok "Правила версии 1.0 помечены меткой $TAG: $n"
+        persist_rules
+    fi
+}
+
+# Приводит iptables к routes.db: ставит недостающие маршруты и снимает
+# помеченные, которых в базе нет. Юнит вызывает это при загрузке.
+sync_routes() {
+    hdr "Синхронизация маршрутов с $ROUTES_DB"
+    local proto in_port tip tport name iface line d rules old n=0 keys=" "
+    if [[ -f "$ROUTES_DB" ]]; then
+        while IFS='|' read -r proto in_port tip tport name; do
+            [[ -n "$proto" ]] || continue
+            if ! check_route_args "$proto" "$in_port" "$tip" "$tport" "$name" 2>/dev/null; then
+                warn "Пропущена битая строка базы: $proto|$in_port|$tip|$tport"
+                continue
+            fi
+            keys+="$proto/$in_port "
+            iface=$(route_iface "$tip")
+            [[ -n "$iface" ]] || { warn "Нет маршрута до $tip — :$in_port/$proto пропущен"; continue; }
+            old=()
+            if ! dnat_exists "$proto" "$tip:$tport" "$in_port"; then
+                drop_existing_dnat "$proto" "$in_port"
+                old=("${DROPPED_DESTS[@]}")
+            fi
+            apply_route_rules "$proto" "$in_port" "$tip" "$tport" "$iface" && n=$((n+1))
+            for d in "${old[@]}"; do
+                [[ "$d" == "$tip:$tport" ]] || cleanup_dest "$proto" "$d"
+            done
+        done < "$ROUTES_DB"
+    fi
+    # Помеченные DNAT не из базы (например, восстановленные из старого rules.v4).
+    mapfile -t rules < <(tagged_rules nat PREROUTING)
+    for line in "${rules[@]}"; do
+        [[ "$line" == *"-j DNAT"* ]] || continue
+        proto=$(dnat_proto "$line"); in_port=$(dnat_dport "$line")
+        [[ "$keys" == *" $proto/$in_port "* ]] && continue
+        # shellcheck disable=SC2086
+        iptables -t nat -D ${line#-A } 2>/dev/null
+        cleanup_dest "$proto" "$(dnat_dest "$line")"
+        warn "Снят маршрут, которого нет в базе: :$in_port/$proto"
+    done
+    ok "Маршрутов в работе: $n"
 }
 
 # --- диагностика -------------------------------------------------------------
@@ -391,10 +565,20 @@ doctor() {
 
     hdr "Правила"
     list_routes
-    if [[ -f /etc/iptables/rules.v4 ]] && grep -q "DNAT" /etc/iptables/rules.v4 2>/dev/null; then
-        ok "DNAT есть в сохранённых правилах (/etc/iptables/rules.v4)"
-    else
-        warn "В /etc/iptables/rules.v4 нет DNAT — после ребута маршруты пропадут"
+    if systemctl is-enabled --quiet "$UNIT_NAME" 2>/dev/null; then
+        ok "Автовосстановление после ребута включено ($UNIT_NAME)"
+    elif [[ -s "$ROUTES_DB" ]]; then
+        warn "$UNIT_NAME не включён — после ребута маршруты пропадут. Запусти: begleq-cascade sync"
+    fi
+    local line
+    while IFS= read -r line; do
+        [[ "$line" =~ ^-A\ POSTROUTING\ -o\ ([^ ]+)\ -j\ MASQUERADE$ ]] || continue
+        warn "Общее правило MASQUERADE на ${BASH_REMATCH[1]} (так делала v1.0) — маскирует весь трафик."
+        msg "  Если оно не нужно другим сервисам: iptables -t nat -D POSTROUTING -o ${BASH_REMATCH[1]} -j MASQUERADE"
+    done < <(iptables -t nat -S POSTROUTING 2>/dev/null)
+    if command -v docker >/dev/null 2>&1 && command -v netfilter-persistent >/dev/null 2>&1; then
+        warn "docker + netfilter-persistent: rules.v4 не обновляю (правила docker задвоятся после ребута)."
+        msg "  Маршруты поднимает $UNIT_NAME, rules.v4 для них не нужен."
     fi
 
     if [[ -n "$target" || -n "$tport" ]] && ! { valid_ip "$target" && valid_port "$tport"; }; then
@@ -446,6 +630,7 @@ show_menu() {
         echo -e "5) ${RED}Удалить маршрут${NC}"
         echo -e "6) ${GREEN}Диагностика (doctor)${NC}"
         echo -e "7) Применить тюнинг системы (conntrack/BBR)"
+        echo -e "8) Восстановить маршруты из базы (sync)"
         echo -e "0) Выход"
         echo "------------------------------------------------------"
         read -r -p "Выбор: " c
@@ -458,6 +643,7 @@ show_menu() {
             6) read -r -p "IP выхода для проверки (Enter — пропустить): " t
                if [[ -n "$t" ]]; then read -r -p "Порт выхода: " tp; doctor "$t" "$tp"; else doctor; fi ;;
             7) prepare_system ;;
+            8) sync_routes; persist_rules ;;
             0) exit 0 ;;
             *) ;;
         esac
@@ -476,12 +662,16 @@ begleq-cascade v$VERSION — каскад VPN-нод (вход → выход) �
   begleq-cascade list
   begleq-cascade replace-hop OLD_IP NEW_IP
   begleq-cascade doctor [OUT_IP OUT_PORT]
+  begleq-cascade sync                             поднять маршруты из базы
   begleq-cascade tune
 
 Примеры:
   begleq-cascade add tcp 8443 203.0.113.10 2053 finland
   begleq-cascade replace-hop 203.0.113.10 203.0.113.20
   begleq-cascade doctor 203.0.113.10 2053
+
+Только IPv4. Маршруты хранятся в $ROUTES_DB и поднимаются
+после ребута юнитом $UNIT_NAME.
 
 Важно: DNAT срабатывает в PREROUTING — проверять цепочку нужно С ВНЕШНЕГО хоста,
 трафик с самой релей-ноды идёт через OUTPUT и правило не поймает.
@@ -492,6 +682,7 @@ case "${1:-}" in -h|--help|help) usage; exit 0 ;; esac
 
 check_root
 acquire_lock
+migrate_legacy
 
 if (( $# > 0 )); then
     case "$1" in
@@ -502,6 +693,7 @@ if (( $# > 0 )); then
         list|ls)      list_routes ;;
         replace-hop)  shift; [[ $# -ge 2 ]] || { usage; exit 2; }; replace_hop "$1" "$2" ;;
         doctor|check) shift; doctor "${1:-}" "${2:-}" ;;
+        sync)         sync_routes; [[ "${2:-}" == --boot ]] || persist_rules ;;
         tune)         prepare_system ;;
         *) err "Неизвестная команда: $1"; usage >&2; exit 2 ;;
     esac
