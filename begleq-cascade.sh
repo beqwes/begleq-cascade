@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip; *|*|src_ip — все маршруты
@@ -425,27 +425,39 @@ route_name() {  # proto in_port
     awk -F'|' -v p="$1" -v d="$2" '$1==p && $2==d {print $5}' "$ROUTES_DB" 2>/dev/null
 }
 
+# IP-исключения маршрута: свои (proto|port|ip) и общие (*|*|ip, с пометкой).
+route_excepts() {  # proto in_port
+    awk -F'|' -v p="$1" -v d="$2" '
+        $1==p && $2==d { out = out sep $3; sep = ", " }
+        $1=="*"        { out = out sep $3 " (все маршруты)"; sep = ", " }
+        END { print out }' "$EXCEPT_DB" 2>/dev/null
+}
+
 list_routes() {
     hdr "Активные маршруты (из iptables)"
-    local found=0 line proto dport dest name foreign
+    local found=0 line proto dport dest name exc foreign orphans
     while IFS= read -r line; do
         [[ "$line" == *"-j DNAT"* ]] || continue
         proto=$(dnat_proto "$line"); dport=$(dnat_dport "$line"); dest=$(dnat_dest "$line")
         name=$(route_name "$proto" "$dport")
         printf "  ${GREEN}:%-6s${NC} %-4s → ${CYAN}%-22s${NC} %s\n" \
             "$dport" "$proto" "$dest" "${name:+[$name]}"
+        # Исключения — не маршруты, а адреса, которые этот маршрут пропускает
+        # в локальный сервис. Показываем их под маршрутом.
+        exc=$(route_excepts "$proto" "$dport")
+        [[ -n "$exc" ]] && printf "          ${YELLOW}кроме подключений с:${NC} %s → идут в локальный сервис\n" "$exc"
         found=1
     done < <(tagged_rules nat PREROUTING)
     (( found )) || msg "  ${YELLOW}маршрутов нет${NC}"
-    local e_proto e_port e_ip
-    while IFS='|' read -r e_proto e_port e_ip; do
-        [[ -n "$e_ip" ]] || continue
-        if [[ "$e_proto" == "*" ]]; then
-            printf "  ${YELLOW}%-7s${NC} %-4s ← %s не пересылается (исключение)\n" "все" "" "$e_ip"
-        else
-            printf "  ${YELLOW}:%-6s${NC} %-4s ← %s не пересылается (исключение)\n" "$e_port" "$e_proto" "$e_ip"
-        fi
-    done < <(cat "$EXCEPT_DB" 2>/dev/null)
+    # Исключения для порта, на котором маршрута нет (например, ещё не добавлен).
+    orphans=$(awk -F'|' '$1!="*" && $3!="" {print $1 "|" $2 "|" $3}' "$EXCEPT_DB" 2>/dev/null \
+        | while IFS='|' read -r proto dport line; do
+              route_exists "$proto" "$dport" || echo "  :$dport/$proto — $line"
+          done)
+    if [[ -n "$orphans" ]]; then
+        msg "  Исключения без маршрута (заработают, когда маршрут появится):"
+        msg "$orphans"
+    fi
     foreign=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "-j DNAT" \
         | grep -cvF -- "--comment $TAG")
     (( foreign )) && msg "  (ещё DNAT-правил не от begleq-cascade: $foreign — не трогаю)"
