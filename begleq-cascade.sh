@@ -7,9 +7,10 @@
 
 set -o pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
+EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip
 SYSCTL_FILE="/etc/sysctl.d/99-begleq-cascade.conf"
 MODULES_FILE="/etc/modules-load.d/begleq-cascade.conf"
 MODPROBE_FILE="/etc/modprobe.d/begleq-cascade.conf"
@@ -377,6 +378,9 @@ add_route() {  # proto in_port target_ip target_port [name]
         warn "Порт $in_port/$proto уже слушает локальный сервис:"
         ss "$ssflag" 2>/dev/null | grep -E "[:.]$in_port\b" | sed 's/^/      /'
         warn "DNAT перехватит трафик раньше него."
+        msg "  Если Reality на выходе берёт маскировочный сайт отсюда (target = домен"
+        msg "  этого сервера), исключи выход из пересылки, иначе будет петля:"
+        msg "    begleq-cascade except add $proto $in_port $tip"
     fi
 
     hdr "Маршрут: :$in_port/$proto → $tip:$tport (iface $iface)"
@@ -405,6 +409,7 @@ del_route() {  # proto in_port
         warn "DNAT для :$in_port/$proto не найден"
     fi
     for d in "${DROPPED_DESTS[@]}"; do cleanup_dest "$proto" "$d"; done
+    except_drop_port "$proto" "$in_port"
     flush_conntrack_port "$proto" "$in_port"
     db_del "$proto" "$in_port"
     persist_rules
@@ -427,6 +432,11 @@ list_routes() {
         found=1
     done < <(tagged_rules nat PREROUTING)
     (( found )) || msg "  ${YELLOW}маршрутов нет${NC}"
+    while IFS= read -r line; do
+        [[ "$line" == *"-j RETURN"* ]] || continue
+        printf "  ${YELLOW}:%-6s${NC} %-4s ← %s не пересылается (исключение)\n" \
+            "$(dnat_dport "$line")" "$(dnat_proto "$line")" "$(except_src "$line")"
+    done < <(tagged_rules nat PREROUTING)
     foreign=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "-j DNAT" \
         | grep -cvF -- "--comment $TAG")
     (( foreign )) && msg "  (ещё DNAT-правил не от begleq-cascade: $foreign — не трогаю)"
@@ -455,6 +465,114 @@ replace_hop() {  # old_ip new_ip
     else
         warn "Маршрутов с $old не найдено"
     fi
+}
+
+# --- исключения -------------------------------------------------------------
+# Подключения с этих IP на входящий порт не пересылаются, а попадают в
+# локальный сервис. Нужно, когда Reality на выходе берёт маскировочный сайт
+# отсюда (target = домен этого сервера): без исключения её запрос за сайтом
+# уйдёт по DNAT обратно на неё же — петля, сайт не открывается.
+
+except_src() { sed -n 's/.*-s \([0-9.]*\)\/32 .*/\1/p' <<< "$1"; }
+
+route_exists() {  # proto in_port
+    awk -F'|' -v p="$1" -v d="$2" '$1==p && $2==d {f=1} END {exit !f}' "$ROUTES_DB" 2>/dev/null
+}
+
+# Удаляет из файла строки, точно равные данной.
+file_drop_line() {  # file line
+    [[ -f "$1" ]] || return 0
+    grep -vxF -- "$2" "$1" > "$1.tmp" 2>/dev/null
+    chmod 600 "$1.tmp"; mv "$1.tmp" "$1"
+}
+
+# RETURN всегда вставляется в начало цепочки, а DNAT добавляется в конец —
+# так исключение срабатывает раньше пересылки, в том числе после sync.
+apply_except_rule() {  # proto in_port src_ip
+    local r=(-s "$3" -p "$1" --dport "$2" "${CMT[@]}" -j RETURN)
+    iptables -t nat -C PREROUTING "${r[@]}" 2>/dev/null \
+        || iptables -t nat -I PREROUTING 1 "${r[@]}"
+}
+
+check_except_args() {  # proto in_port src_ip
+    valid_proto "$1" || { err "Протокол должен быть tcp или udp: $1"; return 1; }
+    valid_port  "$2" || { err "Некорректный входящий порт: $2"; return 1; }
+    valid_ip    "$3" || { err "Некорректный IP: $3"; return 1; }
+}
+
+except_add() {  # proto in_port src_ip
+    check_except_args "$@" || return 1
+    mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+    apply_except_rule "$@" || { err "Не удалось добавить исключение."; return 1; }
+    if ! grep -qxF -- "$1|$2|$3" "$EXCEPT_DB" 2>/dev/null; then
+        echo "$1|$2|$3" >> "$EXCEPT_DB"
+    fi
+    chmod 600 "$EXCEPT_DB"
+    # Уже открытые соединения с этого IP идут по старому DNAT — сбрасываем.
+    if command -v conntrack >/dev/null 2>&1; then
+        conntrack -D -p "$1" -s "$3" --orig-port-dst "$2" >/dev/null 2>&1
+    fi
+    persist_rules
+    ok "Исключение: подключения с $3 на :$2/$1 идут в локальный сервис"
+    route_exists "$1" "$2" || warn "Маршрута :$2/$1 пока нет — исключение заработает вместе с ним"
+}
+
+except_del() {  # proto in_port src_ip
+    check_except_args "$@" || return 1
+    del_tagged nat PREROUTING "-s $3/32 " "-p $1 " "--dport $2 " "-j RETURN "
+    file_drop_line "$EXCEPT_DB" "$1|$2|$3"
+    persist_rules
+    ok "Исключение для $3 на :$2/$1 снято"
+}
+
+# Исключения порта без маршрута бессмысленны — снимаются вместе с маршрутом.
+except_drop_port() {  # proto in_port
+    del_tagged nat PREROUTING "-p $1 " "--dport $2 " "-j RETURN "
+    [[ -f "$EXCEPT_DB" ]] || return 0
+    awk -F'|' -v p="$1" -v d="$2" '!($1==p && $2==d)' "$EXCEPT_DB" > "$EXCEPT_DB.tmp"
+    chmod 600 "$EXCEPT_DB.tmp"; mv "$EXCEPT_DB.tmp" "$EXCEPT_DB"
+}
+
+# Ручное исключение вида `-s IP -p tcp --dport 443 -j RETURN` для порта
+# нашего маршрута берём под управление: помечаем и пишем в базу, иначе
+# после ребута юнит поднимет DNAT, а исключение пропадёт — вернётся петля.
+adopt_manual_excepts() {
+    [[ -s "$ROUTES_DB" ]] || return 0
+    local rules line src proto port n=0
+    local re='^-A PREROUTING -s ([0-9.]+)/32 -p (tcp|udp) -m (tcp|udp) --dport ([0-9]+) -j RETURN$'
+    mapfile -t rules < <(iptables -t nat -S PREROUTING 2>/dev/null)
+    for line in "${rules[@]}"; do
+        [[ "$line" =~ $re ]] || continue
+        src=${BASH_REMATCH[1]}; proto=${BASH_REMATCH[2]}; port=${BASH_REMATCH[4]}
+        route_exists "$proto" "$port" || continue
+        NO_PERSIST=1 except_add "$proto" "$port" "$src" >/dev/null || continue
+        # shellcheck disable=SC2086
+        iptables -t nat -D ${line#-A } 2>/dev/null
+        ok "Ручное исключение $src → :$port/$proto взято под управление (переживёт ребут)"
+        n=$((n+1))
+    done
+    (( n )) && persist_rules
+    return 0
+}
+
+# Поднимает исключения из базы и снимает помеченные, которых в базе нет.
+sync_excepts() {
+    local proto port src line rules keys=" "
+    if [[ -f "$EXCEPT_DB" ]]; then
+        while IFS='|' read -r proto port src; do
+            [[ -n "$proto" ]] || continue
+            check_except_args "$proto" "$port" "$src" 2>/dev/null || continue
+            keys+="$proto/$port/$src "
+            apply_except_rule "$proto" "$port" "$src"
+        done < "$EXCEPT_DB"
+    fi
+    mapfile -t rules < <(tagged_rules nat PREROUTING)
+    for line in "${rules[@]}"; do
+        [[ "$line" == *"-j RETURN"* ]] || continue
+        [[ "$keys" == *" $(dnat_proto "$line")/$(dnat_dport "$line")/$(except_src "$line") "* ]] && continue
+        # shellcheck disable=SC2086
+        iptables -t nat -D ${line#-A } 2>/dev/null
+    done
 }
 
 # v1.0 ставила правила без метки. Помечаем те, что совпадают с routes.db, —
@@ -519,6 +637,7 @@ sync_routes() {
         cleanup_dest "$proto" "$(dnat_dest "$line")"
         warn "Снят маршрут, которого нет в базе: :$in_port/$proto"
     done
+    sync_excepts
     ok "Маршрутов в работе: $n"
 }
 
@@ -565,6 +684,18 @@ doctor() {
 
     hdr "Правила"
     list_routes
+    # Локальный сервис на порту маршрута, а выход не исключён — признак
+    # будущей петли, если Reality на выходе берёт сайт отсюда.
+    local r_proto r_port r_ip _rest ssflag
+    while IFS='|' read -r r_proto r_port r_ip _rest; do
+        [[ -n "$r_proto" ]] || continue
+        ssflag=-tlnp; [[ "$r_proto" == udp ]] && ssflag=-ulnp
+        ss "$ssflag" 2>/dev/null | grep -qE "[:.]$r_port\b" || continue
+        grep -qxF -- "$r_proto|$r_port|$r_ip" "$EXCEPT_DB" 2>/dev/null && continue
+        warn ":$r_port/$r_proto слушает локальный сервис, но $r_ip не исключён из пересылки."
+        msg "  Если Reality на $r_ip берёт сайт отсюда — это петля. Лечение:"
+        msg "    begleq-cascade except add $r_proto $r_port $r_ip"
+    done < <(cat "$ROUTES_DB" 2>/dev/null)
     if systemctl is-enabled --quiet "$UNIT_NAME" 2>/dev/null; then
         ok "Автовосстановление после ребута включено ($UNIT_NAME)"
     elif [[ -s "$ROUTES_DB" ]]; then
@@ -631,6 +762,7 @@ show_menu() {
         echo -e "6) ${GREEN}Диагностика (doctor)${NC}"
         echo -e "7) Применить тюнинг системы (conntrack/BBR)"
         echo -e "8) Восстановить маршруты из базы (sync)"
+        echo -e "9) Исключение: не пересылать подключения с IP"
         echo -e "0) Выход"
         echo "------------------------------------------------------"
         read -r -p "Выбор: " c
@@ -644,6 +776,10 @@ show_menu() {
                if [[ -n "$t" ]]; then read -r -p "Порт выхода: " tp; doctor "$t" "$tp"; else doctor; fi ;;
             7) prepare_system ;;
             8) sync_routes; persist_rules ;;
+            9) read -r -p "Добавить или удалить (a/d): " m
+               read -r -p "Протокол (tcp/udp): " p; read -r -p "Входящий порт: " q
+               read -r -p "IP, который не пересылать (обычно выход): " t
+               if [[ "$m" == d ]]; then except_del "$p" "$q" "$t"; else except_add "$p" "$q" "$t"; fi ;;
             0) exit 0 ;;
             *) ;;
         esac
@@ -662,6 +798,8 @@ begleq-cascade v$VERSION — каскад VPN-нод (вход → выход) �
   begleq-cascade list
   begleq-cascade replace-hop OLD_IP NEW_IP
   begleq-cascade doctor [OUT_IP OUT_PORT]
+  begleq-cascade except add|del tcp|udp IN_PORT SRC_IP
+                                                  не пересылать подключения с SRC_IP
   begleq-cascade sync                             поднять маршруты из базы
   begleq-cascade tune
 
@@ -669,6 +807,7 @@ begleq-cascade v$VERSION — каскад VPN-нод (вход → выход) �
   begleq-cascade add tcp 8443 203.0.113.10 2053 finland
   begleq-cascade replace-hop 203.0.113.10 203.0.113.20
   begleq-cascade doctor 203.0.113.10 2053
+  begleq-cascade except add tcp 443 203.0.113.10  (Reality берёт сайт отсюда)
 
 Только IPv4. Маршруты хранятся в $ROUTES_DB и поднимаются
 после ребута юнитом $UNIT_NAME.
@@ -683,6 +822,7 @@ case "${1:-}" in -h|--help|help) usage; exit 0 ;; esac
 check_root
 acquire_lock
 migrate_legacy
+adopt_manual_excepts
 
 if (( $# > 0 )); then
     case "$1" in
@@ -693,6 +833,13 @@ if (( $# > 0 )); then
         list|ls)      list_routes ;;
         replace-hop)  shift; [[ $# -ge 2 ]] || { usage; exit 2; }; replace_hop "$1" "$2" ;;
         doctor|check) shift; doctor "${1:-}" "${2:-}" ;;
+        except)       shift
+                      case "${1:-}" in
+                          add)        shift; [[ $# -ge 3 ]] || { usage; exit 2; }; except_add "$1" "$2" "$3" ;;
+                          del|delete) shift; [[ $# -ge 3 ]] || { usage; exit 2; }; except_del "$1" "$2" "$3" ;;
+                          list|"")    list_routes ;;
+                          *)          usage >&2; exit 2 ;;
+                      esac ;;
         sync)         sync_routes; [[ "${2:-}" == --boot ]] || persist_rules ;;
         tune)         prepare_system ;;
         *) err "Неизвестная команда: $1"; usage >&2; exit 2 ;;
