@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip; *|*|src_ip — все маршруты
@@ -21,9 +21,10 @@ INSTALL_PATH="/usr/local/bin/begleq-cascade"
 LIB_BIN="/usr/local/lib/begleq-cascade/begleq-cascade"   # копия для юнита
 UNIT_NAME="begleq-cascade.service"
 UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
-RPS_SCRIPT="/usr/local/lib/begleq-cascade/rps.sh"
-RPS_UNIT_NAME="begleq-rps.service"
-RPS_UNIT_FILE="/etc/systemd/system/$RPS_UNIT_NAME"
+NET_SCRIPT="/usr/local/lib/begleq-cascade/net.sh"           # RPS + qdisc при загрузке
+NET_UNIT_NAME="begleq-net.service"
+NET_UNIT_FILE="/etc/systemd/system/$NET_UNIT_NAME"
+EXIT_SYSCTL_FILE="/etc/sysctl.d/99-zz-begleq-exit.conf"     # tune --exit
 
 # Метка на всех правилах скрипта: list/del/replace-hop/sync трогают только их.
 TAG="begleq-cascade"
@@ -240,11 +241,13 @@ persist_rules() {
     fi
 }
 
-# --- RPS/RFS ----------------------------------------------------------------
-# У виртуальной сетевой карты VPS часто одна очередь приёма: все прерывания
-# и весь разбор пакетов (а пересылка DNAT целиком живёт в softirq) идут на
-# одно ядро. Оно упирается в 100%, пока остальные простаивают. RPS раздаёт
-# разбор пакетов по всем ядрам, RFS — направляет поток на ядро его процесса.
+# --- сеть: RPS/RFS и qdisc ---------------------------------------------------
+# 1) У виртуальной сетевой карты VPS часто одна очередь приёма: весь разбор
+#    пакетов (а пересылка DNAT целиком живёт в softirq) идёт на одно ядро.
+#    RPS раздаёт его по всем ядрам, RFS — направляет поток на ядро его процесса.
+# 2) default_qdisc=fq действует только на интерфейсы, поднятые ПОСЛЕ установки
+#    параметра. Уже работающая карта остаётся на fq_codel, и BBR пейсит
+#    пакеты таймерами ядра. Ставим fq на карту явно.
 
 # Карты с одной очередью приёма (физические/virtio, без lo, docker, veth…).
 single_queue_ifaces() {
@@ -256,19 +259,42 @@ single_queue_ifaces() {
     done
 }
 
+# Все физические/virtio карты.
+phys_ifaces() {
+    local d
+    for d in /sys/class/net/*; do
+        [[ -e "$d/device" ]] && echo "${d##*/}"
+    done
+}
+
 # Включён ли RPS на интерфейсе (маска не из одних нулей и запятых).
 rps_enabled() {  # iface
     local m; m=$(cat "/sys/class/net/$1/queues/rx-0/rps_cpus" 2>/dev/null)
     [[ -n "$m" && "${m//[0,]/}" != "" ]]
 }
 
-# Скрипт для юнита: при загрузке маска считается заново по числу ядер.
-write_rps_script() {
-    mkdir -p "${RPS_SCRIPT%/*}"
-    cat > "$RPS_SCRIPT" <<'EOF'
+# qdisc карты, если это не fq: «fq_codel» или «mq: fq_codel» (у дочерних).
+# Пусто — всё уже на fq (или у карты нет очереди, как у noqueue).
+qdisc_not_fq() {  # iface
+    command -v tc >/dev/null 2>&1 || return 0
+    local root; root=$(tc qdisc show dev "$1" root 2>/dev/null | awk 'NR==1 {print $2}')
+    case "$root" in
+        fq|noqueue|"") ;;
+        mq) tc qdisc show dev "$1" 2>/dev/null \
+                | awk '$4=="parent" && $2!="fq" {print "mq: " $2; exit}' ;;
+        *)  echo "$root" ;;
+    esac
+}
+
+# Скрипт для юнита: при загрузке маска RPS считается заново по числу ядер.
+write_net_script() {
+    mkdir -p "${NET_SCRIPT%/*}"
+    cat > "$NET_SCRIPT" <<'EOF'
 #!/bin/bash
-# begleq-cascade: RPS/RFS для сетевых карт с одной очередью приёма.
-n=$(nproc); (( n > 1 )) || exit 0
+# begleq-cascade: сетевые настройки, которые не задаются через sysctl.
+#  - RPS/RFS на картах с одной очередью приёма;
+#  - qdisc fq на картах (default_qdisc=fq не трогает уже поднятые интерфейсы).
+n=$(nproc)
 # Маска всех ядер группами по 32 бита: младшие ядра — в правой группе.
 mask=""; left=$n
 while (( left > 0 )); do
@@ -277,60 +303,147 @@ while (( left > 0 )); do
     mask=${mask:+$g,$mask}; mask=${mask:-$g}
     left=$(( left - b ))
 done
+want_fq=0
+[[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == fq ]] && command -v tc >/dev/null && want_fq=1
 for d in /sys/class/net/*; do
     [[ -e "$d/device" ]] || continue
+    i=${d##*/}
     q=("$d"/queues/rx-*)
-    (( ${#q[@]} == 1 )) && [[ -e "${q[0]}" ]] || continue
-    echo "$mask"  > "${q[0]}/rps_cpus"
-    echo 32768    > "${q[0]}/rps_flow_cnt"
+    if (( n > 1 && ${#q[@]} == 1 )) && [[ -e "${q[0]}" ]]; then
+        echo "$mask"  > "${q[0]}/rps_cpus"
+        echo 32768    > "${q[0]}/rps_flow_cnt"
+    fi
+    (( want_fq )) || continue
+    root=$(tc qdisc show dev "$i" root 2>/dev/null | awk 'NR==1 {print $2}')
+    case "$root" in
+        fq|noqueue|"") ;;
+        mq)  # многоочередная карта: fq на каждую очередь, mq оставляем
+             tc qdisc show dev "$i" | awk '$4=="parent" && $2!="fq" {print $5}' \
+                 | while read -r p; do tc qdisc replace dev "$i" parent "$p" fq; done ;;
+        *)   tc qdisc replace dev "$i" root fq ;;
+    esac
 done
+exit 0
 EOF
-    chmod 755 "$RPS_SCRIPT"
+    chmod 755 "$NET_SCRIPT"
 }
 
-setup_rps() {
-    hdr "Распределение сетевой нагрузки по ядрам (RPS/RFS)"
-    local ifaces; ifaces=$(single_queue_ifaces | tr '\n' ' ')
-    if (( $(nproc) < 2 )); then
-        ok "Одно ядро — распределять нечего"; return 0
+setup_net() {
+    hdr "Сеть: нагрузка по ядрам (RPS/RFS) и очередь fq"
+    local i ifaces before="" still="" want_fq=0
+    [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == fq ]] && want_fq=1
+    if (( want_fq )); then
+        for i in $(phys_ifaces); do
+            [[ -n "$(qdisc_not_fq "$i")" ]] && before+="$i ($(qdisc_not_fq "$i")) "
+        done
     fi
-    if [[ -z "${ifaces// /}" ]]; then
-        ok "У сетевых карт несколько очередей — распределяет сама карта"; return 0
-    fi
-    write_rps_script
-    "$RPS_SCRIPT" || { warn "Не удалось включить RPS"; return 1; }
+    write_net_script
+    "$NET_SCRIPT" || warn "Сетевые настройки применились не полностью"
 
     if command -v systemctl >/dev/null 2>&1; then
         local unit
         unit=$(cat <<EOF
 [Unit]
-Description=begleq-cascade: RPS/RFS — сетевая нагрузка на все ядра
+Description=begleq-cascade: RPS/RFS и qdisc fq на сетевых картах
 After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=$RPS_SCRIPT
+ExecStart=$NET_SCRIPT
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 )
-        if [[ "$(cat "$RPS_UNIT_FILE" 2>/dev/null)" != "$unit" ]]; then
-            printf '%s\n' "$unit" > "$RPS_UNIT_FILE"
+        if [[ "$(cat "$NET_UNIT_FILE" 2>/dev/null)" != "$unit" ]]; then
+            printf '%s\n' "$unit" > "$NET_UNIT_FILE"
             systemctl daemon-reload
         fi
-        systemctl enable --quiet "$RPS_UNIT_NAME" 2>/dev/null
-        # Ручной rps.service по прежней инструкции больше не нужен.
+        systemctl enable --quiet "$NET_UNIT_NAME" 2>/dev/null
+        # Юнит версии 1.6 (только RPS) и ручной rps.service заменены этим.
+        if [[ -f /etc/systemd/system/begleq-rps.service ]]; then
+            systemctl disable --quiet begleq-rps.service 2>/dev/null
+            rm -f /etc/systemd/system/begleq-rps.service /usr/local/lib/begleq-cascade/rps.sh
+            systemctl daemon-reload
+        fi
         if grep -qs '^Description=Spread network softirq across CPUs (RPS/RFS)$' \
                 /etc/systemd/system/rps.service; then
             systemctl disable --now --quiet rps.service 2>/dev/null
             rm -f /etc/systemd/system/rps.service /etc/sysctl.d/99-rps.conf
             systemctl daemon-reload
-            ok "Ручной rps.service заменён на $RPS_UNIT_NAME"
+            ok "Ручной rps.service заменён на $NET_UNIT_NAME"
         fi
     fi
-    ok "RPS включён на: ${ifaces% } (ядер: $(nproc), переживёт ребут)"
+
+    ifaces=$(single_queue_ifaces | tr '\n' ' ')
+    if (( $(nproc) < 2 )); then
+        ok "RPS: одно ядро — распределять нечего"
+    elif [[ -z "${ifaces// /}" ]]; then
+        ok "RPS: у сетевых карт несколько очередей — распределяет сама карта"
+    else
+        ok "RPS включён на: ${ifaces% } (ядер: $(nproc))"
+    fi
+    if (( want_fq )); then
+        # Итог — по фактическому состоянию после применения.
+        for i in $(phys_ifaces); do
+            [[ -n "$(qdisc_not_fq "$i")" ]] && still+="$i ($(qdisc_not_fq "$i")) "
+        done
+        if [[ -n "$still" ]]; then
+            warn "Не удалось поставить fq: ${still% }"
+        elif [[ -n "$before" ]]; then
+            ok "qdisc fq поставлен вместо: ${before% }"
+        else
+            ok "qdisc: на сетевых картах уже fq"
+        fi
+    fi
+    ok "Применится и после ребута ($NET_UNIT_NAME)"
+}
+
+# --- режим выходной ноды (tune --exit) ----------------------------------------
+# Reality на каждое подключение клиента сама соединяется с target, чтобы
+# скопировать ответ настоящего сайта, — и для своих клиентов тоже. Если target
+# на другом сервере (например, на входе каскада), выход открывает сотни
+# соединений в секунду на один адрес и сам их закрывает: TIME-WAIT копятся
+# к одному ip:port, и каждый connect() перебирает почти забитый диапазон
+# исходящих портов под блокировкой ядра. Лечится двумя параметрами.
+
+# Порты ≥10000, которые сейчас слушают службы (TCP и UDP).
+high_listen_ports() {
+    ss -Hltnu 2>/dev/null | awk '{print $5}' | sed 's/.*://' \
+        | grep -E '^[0-9]+$' | awk '$1 >= 10000' | sort -n | uniq
+}
+
+apply_exit_tune() {
+    hdr "Режим выходной ноды (Reality с target на другом сервере)"
+    local ports existing merged
+    ports=$(high_listen_ports | paste -sd, -)
+    existing=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null)
+    # Уже зарезервированные порты сохраняем, слушающие ≥10000 добавляем:
+    # иначе ядро может отдать такой порт под исходящее соединение, и служба
+    # при перезапуске получит «Address already in use».
+    merged=$(printf '%s,%s' "$existing" "$ports" | tr ',' '\n' \
+        | grep -E '^[0-9]+(-[0-9]+)?$' | sort -n | uniq | paste -sd, -)
+    {
+        echo "# begleq-cascade tune --exit — выходная нода, target Reality на другом сервере."
+        echo "# Переиспользование TIME-WAIT для исходящих (безопасно при tcp_timestamps)"
+        echo "# и вдвое больший диапазон исходящих портов."
+        echo "net.ipv4.tcp_timestamps=1"
+        echo "net.ipv4.tcp_tw_reuse=1"
+        [[ -n "$merged" ]] && echo "net.ipv4.ip_local_reserved_ports=$merged"
+        echo "net.ipv4.ip_local_port_range=10000 65535"
+    } > "$EXIT_SYSCTL_FILE"
+    local out
+    if ! out=$(sysctl -p "$EXIT_SYSCTL_FILE" 2>&1 >/dev/null); then
+        warn "Часть параметров не применилась:"; sed 's/^/      /' <<< "$out"
+    fi
+    ok "tcp_tw_reuse = $(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null)"
+    ok "ip_local_port_range = $(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null | tr -s '\t ' ' ')"
+    if [[ -n "$merged" ]]; then
+        ok "Зарезервированы порты служб ≥10000: $merged"
+    fi
+    msg "  Появится новая служба на порту ≥10000 — запусти tune --exit ещё раз."
+    ok "Записано в $EXIT_SYSCTL_FILE (переживёт ребут). Откат: rm $EXIT_SYSCTL_FILE && sysctl --system"
 }
 
 prepare_system() {
@@ -338,7 +451,7 @@ prepare_system() {
     touch "$ROUTES_DB"; chmod 600 "$ROUTES_DB"
     install_deps
     apply_sysctl
-    setup_rps
+    setup_net
 }
 
 # --- маршруты ----------------------------------------------------------------
@@ -835,6 +948,36 @@ doctor() {
         fi
     done
     (( any )) || ok "Очередей приёма несколько — нагрузку по ядрам распределяет карта"
+    local nf
+    if [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == fq ]]; then
+        for i in $(phys_ifaces); do
+            nf=$(qdisc_not_fq "$i")
+            if [[ -n "$nf" ]]; then
+                warn "$i: qdisc $nf, а не fq — BBR пейсит пакеты таймерами ядра. Лечение: begleq-cascade tune"
+            else
+                ok "$i: qdisc fq"
+            fi
+        done
+    fi
+
+    # Много TIME-WAIT к одному адресу — почерк Reality с удалённым target.
+    hdr "Исходящие соединения"
+    local tw_n tw_ip reuse
+    read -r tw_n tw_ip < <(ss -Htan state time-wait 2>/dev/null | awk '{print $4}' \
+        | sed -E 's/^\[?(::ffff:)?//; s/\]?:[0-9]+$//' | sort | uniq -c | sort -rn | head -n1)
+    reuse=$(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null)
+    if [[ -n "$tw_n" ]] && (( tw_n > 5000 )); then
+        msg "  TIME-WAIT к $tw_ip: $tw_n"
+        if [[ "$reuse" == 1 ]]; then
+            ok "tcp_tw_reuse = 1, диапазон портов: $(sysctl -n net.ipv4.ip_local_port_range | tr -s '\t ' ' ')"
+        else
+            warn "Тысячи TIME-WAIT к одному адресу, а tcp_tw_reuse = $reuse — connect() перебирает"
+            msg "  почти забитый диапазон портов под блокировкой ядра. Так бывает на выходной"
+            msg "  ноде, если target Reality на другом сервере. Лечение: begleq-cascade tune --exit"
+        fi
+    else
+        ok "TIME-WAIT к одному адресу: ${tw_n:-0} — порты не на пределе"
+    fi
 
     hdr "Conntrack"
     local cnt max pct
@@ -1059,7 +1202,9 @@ show_menu() {
             5) read -r -p "Протокол (tcp/udp): " p; read -r -p "Входящий порт: " q; del_route "$p" "$q" ;;
             6) read -r -p "IP выхода для проверки (Enter — пропустить): " t
                if [[ -n "$t" ]]; then read -r -p "Порт выхода: " tp; doctor "$t" "$tp"; else doctor; fi ;;
-            7) prepare_system ;;
+            7) prepare_system
+               read -r -p "Это выходная нода с Reality, у которой target на другом сервере? (y/N): " x
+               [[ "$x" == [yYдД]* ]] && apply_exit_tune ;;
             8) sync_routes; persist_rules ;;
             9) ask_except ;;
             u|U) UPDATED_PATH=""; self_update
@@ -1091,7 +1236,8 @@ begleq-cascade v$VERSION — каскад VPN-нод (вход → выход) �
   begleq-cascade except add|del SRC_IP            не пересылать SRC_IP ни на одном маршруте
   begleq-cascade sync                             поднять маршруты из базы
   begleq-cascade update                           обновить скрипт с GitHub
-  begleq-cascade tune
+  begleq-cascade tune [--exit]                    тюнинг системы; --exit — для выходной
+                                                  ноды с target Reality на другом сервере
 
 Примеры:
   begleq-cascade add tcp 8443 203.0.113.10 2053 finland
@@ -1137,7 +1283,8 @@ if (( $# > 0 )); then
                       esac ;;
         update)       self_update ;;
         sync)         sync_routes; [[ "${2:-}" == --boot ]] || persist_rules ;;
-        tune)         prepare_system ;;
+        tune)         prepare_system
+                      if [[ "${2:-}" == --exit ]]; then apply_exit_tune; fi ;;
         *) err "Неизвестная команда: $1"; usage >&2; exit 2 ;;
     esac
     exit $?
