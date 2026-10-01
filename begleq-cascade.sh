@@ -7,10 +7,10 @@
 
 set -o pipefail
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
-EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip
+EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip; *|*|src_ip — все маршруты
 SYSCTL_FILE="/etc/sysctl.d/99-begleq-cascade.conf"
 MODULES_FILE="/etc/modules-load.d/begleq-cascade.conf"
 MODPROBE_FILE="/etc/modprobe.d/begleq-cascade.conf"
@@ -394,6 +394,7 @@ add_route() {  # proto in_port target_ip target_port [name]
 
     flush_conntrack_port "$proto" "$in_port"
     db_add "$proto" "$in_port" "$tip" "$tport" "$name"
+    sync_excepts   # исключения «для всех маршрутов» касаются и нового
     persist_rules
     ok "Маршрут поднят: :$in_port/$proto → $tip:$tport"
     msg "${YELLOW}Проверять только С ВНЕШНЕГО хоста${NC} — DNAT живёт в PREROUTING,"
@@ -409,9 +410,9 @@ del_route() {  # proto in_port
         warn "DNAT для :$in_port/$proto не найден"
     fi
     for d in "${DROPPED_DESTS[@]}"; do cleanup_dest "$proto" "$d"; done
-    except_drop_port "$proto" "$in_port"
     flush_conntrack_port "$proto" "$in_port"
     db_del "$proto" "$in_port"
+    except_drop_port "$proto" "$in_port"
     persist_rules
     ok "Маршрут :$in_port/$proto удалён"
 }
@@ -432,11 +433,15 @@ list_routes() {
         found=1
     done < <(tagged_rules nat PREROUTING)
     (( found )) || msg "  ${YELLOW}маршрутов нет${NC}"
-    while IFS= read -r line; do
-        [[ "$line" == *"-j RETURN"* ]] || continue
-        printf "  ${YELLOW}:%-6s${NC} %-4s ← %s не пересылается (исключение)\n" \
-            "$(dnat_dport "$line")" "$(dnat_proto "$line")" "$(except_src "$line")"
-    done < <(tagged_rules nat PREROUTING)
+    local e_proto e_port e_ip
+    while IFS='|' read -r e_proto e_port e_ip; do
+        [[ -n "$e_ip" ]] || continue
+        if [[ "$e_proto" == "*" ]]; then
+            printf "  ${YELLOW}%-7s${NC} %-4s ← %s не пересылается (исключение)\n" "все" "" "$e_ip"
+        else
+            printf "  ${YELLOW}:%-6s${NC} %-4s ← %s не пересылается (исключение)\n" "$e_port" "$e_proto" "$e_ip"
+        fi
+    done < <(cat "$EXCEPT_DB" 2>/dev/null)
     foreign=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "-j DNAT" \
         | grep -cvF -- "--comment $TAG")
     (( foreign )) && msg "  (ещё DNAT-правил не от begleq-cascade: $foreign — не трогаю)"
@@ -468,10 +473,15 @@ replace_hop() {  # old_ip new_ip
 }
 
 # --- исключения -------------------------------------------------------------
-# Подключения с этих IP на входящий порт не пересылаются, а попадают в
-# локальный сервис. Нужно, когда Reality на выходе берёт маскировочный сайт
-# отсюда (target = домен этого сервера): без исключения её запрос за сайтом
-# уйдёт по DNAT обратно на неё же — петля, сайт не открывается.
+# Подключения с этих IP не пересылаются, а попадают в локальный сервис.
+# Нужно, когда Reality на выходе берёт маскировочный сайт отсюда (target =
+# домен этого сервера): без исключения её запрос за сайтом уйдёт по DNAT
+# обратно на неё же — петля, сайт не открывается.
+#
+# Исключение бывает для одного маршрута (tcp|443|IP) или для всех (*|*|IP).
+# «Для всех» разворачивается в RETURN на порт каждого маршрута, а не в общий
+# `-s IP -j RETURN`: тот увёл бы IP и мимо `-j DOCKER`, сломав ему
+# опубликованные порты контейнеров.
 
 except_src() { sed -n 's/.*-s \([0-9.]*\)\/32 .*/\1/p' <<< "$1"; }
 
@@ -486,21 +496,40 @@ file_drop_line() {  # file line
     chmod 600 "$1.tmp"; mv "$1.tmp" "$1"
 }
 
+# Пары «proto port», на которые действует исключение.
+except_ports() {  # proto in_port
+    if [[ "$1" == "*" ]]; then
+        awk -F'|' 'NF >= 2 && $1 != "" {print $1, $2}' "$ROUTES_DB" 2>/dev/null
+    else
+        echo "$1 $2"
+    fi
+}
+
 # RETURN всегда вставляется в начало цепочки, а DNAT добавляется в конец —
 # так исключение срабатывает раньше пересылки, в том числе после sync.
 apply_except_rule() {  # proto in_port src_ip
-    local r=(-s "$3" -p "$1" --dport "$2" "${CMT[@]}" -j RETURN)
-    iptables -t nat -C PREROUTING "${r[@]}" 2>/dev/null \
-        || iptables -t nat -I PREROUTING 1 "${r[@]}"
+    local p d r rc=0
+    while read -r p d; do
+        r=(-s "$3" -p "$p" --dport "$d" "${CMT[@]}" -j RETURN)
+        iptables -t nat -C PREROUTING "${r[@]}" 2>/dev/null \
+            || iptables -t nat -I PREROUTING 1 "${r[@]}" || rc=1
+    done < <(except_ports "$1" "$2")
+    return $rc
 }
 
 check_except_args() {  # proto in_port src_ip
-    valid_proto "$1" || { err "Протокол должен быть tcp или udp: $1"; return 1; }
-    valid_port  "$2" || { err "Некорректный входящий порт: $2"; return 1; }
-    valid_ip    "$3" || { err "Некорректный IP: $3"; return 1; }
+    if [[ "$1" != "*" || "$2" != "*" ]]; then
+        valid_proto "$1" || { err "Протокол должен быть tcp или udp: $1"; return 1; }
+        valid_port  "$2" || { err "Некорректный входящий порт: $2"; return 1; }
+    fi
+    valid_ip "$3" || { err "Некорректный IP: $3"; return 1; }
 }
 
-except_add() {  # proto in_port src_ip
+except_desc() {  # proto in_port
+    if [[ "$1" == "*" ]]; then echo "все маршруты"; else echo ":$2/$1"; fi
+}
+
+except_add() {  # proto in_port src_ip   (или * * src_ip — для всех маршрутов)
     check_except_args "$@" || return 1
     mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
     apply_except_rule "$@" || { err "Не удалось добавить исключение."; return 1; }
@@ -510,45 +539,64 @@ except_add() {  # proto in_port src_ip
     chmod 600 "$EXCEPT_DB"
     # Уже открытые соединения с этого IP идут по старому DNAT — сбрасываем.
     if command -v conntrack >/dev/null 2>&1; then
-        conntrack -D -p "$1" -s "$3" --orig-port-dst "$2" >/dev/null 2>&1
+        local p d
+        while read -r p d; do
+            conntrack -D -p "$p" -s "$3" --orig-port-dst "$d" >/dev/null 2>&1
+        done < <(except_ports "$1" "$2")
     fi
     persist_rules
-    ok "Исключение: подключения с $3 на :$2/$1 идут в локальный сервис"
-    route_exists "$1" "$2" || warn "Маршрута :$2/$1 пока нет — исключение заработает вместе с ним"
+    ok "Исключение: подключения с $3 ($(except_desc "$1" "$2")) идут в локальный сервис"
+    if [[ "$1" == "*" ]]; then
+        [[ -s "$ROUTES_DB" ]] || warn "Маршрутов пока нет — исключение заработает вместе с ними"
+    else
+        route_exists "$1" "$2" || warn "Маршрута :$2/$1 пока нет — исключение заработает вместе с ним"
+    fi
 }
 
-except_del() {  # proto in_port src_ip
+except_del() {  # proto in_port src_ip   (или * * src_ip)
     check_except_args "$@" || return 1
-    del_tagged nat PREROUTING "-s $3/32 " "-p $1 " "--dport $2 " "-j RETURN "
+    if ! grep -qxF -- "$1|$2|$3" "$EXCEPT_DB" 2>/dev/null; then
+        warn "Исключения для $3 ($(except_desc "$1" "$2")) нет"
+        return 1
+    fi
     file_drop_line "$EXCEPT_DB" "$1|$2|$3"
+    sync_excepts   # снимет RETURN, которые больше ничем не покрыты
     persist_rules
-    ok "Исключение для $3 на :$2/$1 снято"
+    ok "Исключение для $3 ($(except_desc "$1" "$2")) снято"
 }
 
 # Исключения порта без маршрута бессмысленны — снимаются вместе с маршрутом.
+# Исключения «для всех» остаются в базе, их RETURN на этот порт уберёт sync.
 except_drop_port() {  # proto in_port
-    del_tagged nat PREROUTING "-p $1 " "--dport $2 " "-j RETURN "
-    [[ -f "$EXCEPT_DB" ]] || return 0
-    awk -F'|' -v p="$1" -v d="$2" '!($1==p && $2==d)' "$EXCEPT_DB" > "$EXCEPT_DB.tmp"
-    chmod 600 "$EXCEPT_DB.tmp"; mv "$EXCEPT_DB.tmp" "$EXCEPT_DB"
+    if [[ -f "$EXCEPT_DB" ]]; then
+        awk -F'|' -v p="$1" -v d="$2" '!($1==p && $2==d)' "$EXCEPT_DB" > "$EXCEPT_DB.tmp"
+        chmod 600 "$EXCEPT_DB.tmp"; mv "$EXCEPT_DB.tmp" "$EXCEPT_DB"
+    fi
+    sync_excepts
 }
 
 # Ручное исключение вида `-s IP -p tcp --dport 443 -j RETURN` для порта
-# нашего маршрута берём под управление: помечаем и пишем в базу, иначе
+# нашего маршрута (или общее `-s IP -j RETURN`) берём под управление: помечаем и пишем в базу, иначе
 # после ребута юнит поднимет DNAT, а исключение пропадёт — вернётся петля.
 adopt_manual_excepts() {
     [[ -s "$ROUTES_DB" ]] || return 0
     local rules line src proto port n=0
     local re='^-A PREROUTING -s ([0-9.]+)/32 -p (tcp|udp) -m (tcp|udp) --dport ([0-9]+) -j RETURN$'
+    local re_all='^-A PREROUTING -s ([0-9.]+)/32 -j RETURN$'
     mapfile -t rules < <(iptables -t nat -S PREROUTING 2>/dev/null)
     for line in "${rules[@]}"; do
-        [[ "$line" =~ $re ]] || continue
-        src=${BASH_REMATCH[1]}; proto=${BASH_REMATCH[2]}; port=${BASH_REMATCH[4]}
-        route_exists "$proto" "$port" || continue
+        if [[ "$line" =~ $re ]]; then
+            src=${BASH_REMATCH[1]}; proto=${BASH_REMATCH[2]}; port=${BASH_REMATCH[4]}
+            route_exists "$proto" "$port" || continue
+        elif [[ "$line" =~ $re_all ]]; then
+            src=${BASH_REMATCH[1]}; proto="*"; port="*"
+        else
+            continue
+        fi
         NO_PERSIST=1 except_add "$proto" "$port" "$src" >/dev/null || continue
         # shellcheck disable=SC2086
         iptables -t nat -D ${line#-A } 2>/dev/null
-        ok "Ручное исключение $src → :$port/$proto взято под управление (переживёт ребут)"
+        ok "Ручное исключение $src ($(except_desc "$proto" "$port")) взято под управление (переживёт ребут)"
         n=$((n+1))
     done
     (( n )) && persist_rules
@@ -562,7 +610,8 @@ sync_excepts() {
         while IFS='|' read -r proto port src; do
             [[ -n "$proto" ]] || continue
             check_except_args "$proto" "$port" "$src" 2>/dev/null || continue
-            keys+="$proto/$port/$src "
+            local p d
+            while read -r p d; do keys+="$p/$d/$src "; done < <(except_ports "$proto" "$port")
             apply_except_rule "$proto" "$port" "$src"
         done < "$EXCEPT_DB"
     fi
@@ -691,7 +740,7 @@ doctor() {
         [[ -n "$r_proto" ]] || continue
         ssflag=-tlnp; [[ "$r_proto" == udp ]] && ssflag=-ulnp
         ss "$ssflag" 2>/dev/null | grep -qE "[:.]$r_port\b" || continue
-        grep -qxF -- "$r_proto|$r_port|$r_ip" "$EXCEPT_DB" 2>/dev/null && continue
+        grep -qxF -e "$r_proto|$r_port|$r_ip" -e "*|*|$r_ip" "$EXCEPT_DB" 2>/dev/null && continue
         warn ":$r_port/$r_proto слушает локальный сервис, но $r_ip не исключён из пересылки."
         msg "  Если Reality на $r_ip берёт сайт отсюда — это петля. Лечение:"
         msg "    begleq-cascade except add $r_proto $r_port $r_ip"
@@ -748,37 +797,42 @@ ask_route() {  # proto
     add_route "$proto" "$in_port" "$tip" "$tport" "$name"
 }
 
-# Исключение из меню: выбираем маршрут по номеру, IP по умолчанию — его выход.
-# Повторный выбор того же маршрута и IP снимает исключение.
+# Исключение из меню: для одного маршрута (по номеру, IP по умолчанию — его
+# выход) или для всех маршрутов сразу по IP. Повтор того же снимает исключение.
 ask_except() {
     hdr "Исключение из пересылки"
     msg "Нужно, если на этом сервере стоит маскировочный сайт, а Reality на выходе"
-    msg "берёт его отсюда (target = домен этого сервера). Подключения с IP выхода"
-    msg "пойдут в локальный nginx, а не обратно на выход — иначе петля."
-    msg ""
-    local routes=() line i proto port tip tport name ip
+    msg "берёт его отсюда (target = домен этого сервера). Подключения с указанного"
+    msg "IP пойдут в локальный nginx, а не обратно на выход — иначе петля."
+    local routes=() line i proto port tip tport name ip mode a
     while IFS= read -r line; do
         [[ -n "$line" ]] && routes+=("$line")
     done < <(cat "$ROUTES_DB" 2>/dev/null)
-    if (( ${#routes[@]} == 0 )); then
-        warn "Маршрутов нет — сначала добавь маршрут (пункт 1 или 2)."
-        return 1
+    list_routes
+    msg ""
+    msg "  1) Для одного маршрута"
+    msg "  2) Для всех маршрутов — по IP"
+    read -r -p "Выбор [1]: " mode
+    if [[ "$mode" == 2 ]]; then
+        read -r -p "IP, который не пересылать: " ip
+        proto="*"; port="*"
+    else
+        if (( ${#routes[@]} == 0 )); then
+            warn "Маршрутов нет — выбери 2 или сначала добавь маршрут (пункт 1 или 2)."
+            return 1
+        fi
+        for i in "${!routes[@]}"; do
+            IFS='|' read -r proto port tip tport name <<< "${routes[i]}"
+            printf "  %d) :%s/%s → %s:%s %s\n" $((i+1)) "$port" "$proto" "$tip" "$tport" "${name:+[$name]}"
+        done
+        read -r -p "Номер маршрута: " i
+        if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i < 1 || i > ${#routes[@]} )); then
+            err "Нет маршрута с номером '$i'"; return 1
+        fi
+        IFS='|' read -r proto port tip tport name <<< "${routes[i-1]}"
+        read -r -p "IP, который не пересылать [Enter — $tip, выход]: " ip
+        ip=${ip:-$tip}
     fi
-    for i in "${!routes[@]}"; do
-        IFS='|' read -r proto port tip tport name <<< "${routes[i]}"
-        printf "  %d) :%s/%s → %s:%s %s" $((i+1)) "$port" "$proto" "$tip" "$tport" "${name:+[$name]}"
-        grep -q -- "^$proto|$port|" "$EXCEPT_DB" 2>/dev/null \
-            && printf "  ${YELLOW}(исключено: %s)${NC}" \
-                "$(awk -F'|' -v p="$proto" -v d="$port" '$1==p && $2==d {printf "%s ", $3}' "$EXCEPT_DB")"
-        echo
-    done
-    read -r -p "Номер маршрута: " i
-    if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i < 1 || i > ${#routes[@]} )); then
-        err "Нет маршрута с номером '$i'"; return 1
-    fi
-    IFS='|' read -r proto port tip tport name <<< "${routes[i-1]}"
-    read -r -p "IP, который пропускать мимо пересылки [Enter — $tip, выход]: " ip
-    ip=${ip:-$tip}
     if grep -qxF -- "$proto|$port|$ip" "$EXCEPT_DB" 2>/dev/null; then
         read -r -p "Исключение для $ip уже есть. Снять его? (y/N): " a
         [[ "$a" == [yYдД]* ]] && except_del "$proto" "$port" "$ip"
@@ -835,7 +889,8 @@ begleq-cascade v$VERSION — каскад VPN-нод (вход → выход) �
   begleq-cascade replace-hop OLD_IP NEW_IP
   begleq-cascade doctor [OUT_IP OUT_PORT]
   begleq-cascade except add|del tcp|udp IN_PORT SRC_IP
-                                                  не пересылать подключения с SRC_IP
+                                                  не пересылать SRC_IP на этом маршруте
+  begleq-cascade except add|del SRC_IP            не пересылать SRC_IP ни на одном маршруте
   begleq-cascade sync                             поднять маршруты из базы
   begleq-cascade tune
 
@@ -871,8 +926,13 @@ if (( $# > 0 )); then
         doctor|check) shift; doctor "${1:-}" "${2:-}" ;;
         except)       shift
                       case "${1:-}" in
-                          add)        shift; [[ $# -ge 3 ]] || { usage; exit 2; }; except_add "$1" "$2" "$3" ;;
-                          del|delete) shift; [[ $# -ge 3 ]] || { usage; exit 2; }; except_del "$1" "$2" "$3" ;;
+                          add|del|delete)
+                              fn=except_add; [[ "$1" == add ]] || fn=except_del; shift
+                              case $# in
+                                  1) "$fn" "*" "*" "$1" ;;
+                                  3) "$fn" "$1" "$2" "$3" ;;
+                                  *) usage >&2; exit 2 ;;
+                              esac ;;
                           list|"")    list_routes ;;
                           *)          usage >&2; exit 2 ;;
                       esac ;;
