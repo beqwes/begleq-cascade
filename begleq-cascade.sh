@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip; *|*|src_ip — все маршруты
@@ -15,6 +15,9 @@ SYSCTL_FILE="/etc/sysctl.d/99-begleq-cascade.conf"
 MODULES_FILE="/etc/modules-load.d/begleq-cascade.conf"
 MODPROBE_FILE="/etc/modprobe.d/begleq-cascade.conf"
 LOCK_FILE="/run/begleq-cascade.lock"
+REPO="beqwes/begleq-cascade"
+BRANCH="master"
+INSTALL_PATH="/usr/local/bin/begleq-cascade"
 LIB_BIN="/usr/local/lib/begleq-cascade/begleq-cascade"   # копия для юнита
 UNIT_NAME="begleq-cascade.service"
 UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
@@ -23,6 +26,7 @@ UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
 TAG="begleq-cascade"
 CMT=(-m comment --comment "$TAG")
 
+UPDATED_PATH=""     # заполняет self_update: куда записана новая версия
 NO_PERSIST=0        # 1 — add_route не сохраняет правила сам (пакетные операции)
 DROPPED_DESTS=()    # заполняет drop_existing_dnat: ip:port снятых DNAT
 
@@ -784,6 +788,66 @@ doctor() {
     msg ""
 }
 
+# --- обновление --------------------------------------------------------------
+
+fetch() {  # url [header] → stdout
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 30 ${2:+-H "$2"} "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- --timeout=30 ${2:+--header="$2"} "$1"
+    else
+        err "Нет ни curl, ни wget."; return 1
+    fi
+}
+
+# Качает свежую версию и ставит её вместо текущей.
+# Файл берётся по SHA последнего коммита, а не по имени ветки: raw.githubusercontent
+# кэширует ветку до ~5 минут и может отдать старую версию.
+self_update() {
+    hdr "Обновление begleq-cascade"
+    local sha url tmp target new_ver
+    sha=$(fetch "https://api.github.com/repos/$REPO/commits/$BRANCH" \
+        "Accept: application/vnd.github.sha" 2>/dev/null)
+    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+        url="https://raw.githubusercontent.com/$REPO/$sha/begleq-cascade.sh"
+    else
+        warn "GitHub API недоступен — качаю по ветке (может отдать версию из кэша)"
+        url="https://raw.githubusercontent.com/$REPO/$BRANCH/begleq-cascade.sh"
+        sha=""
+    fi
+
+    tmp=$(mktemp) || return 1
+    if ! fetch "$url" > "$tmp" || [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"; err "Не удалось скачать $url"; return 1
+    fi
+    # Проверяем, что скачался именно скрипт и он синтаксически цел.
+    if [[ "$(head -n1 "$tmp")" != "#!/usr/bin/env bash" ]] \
+            || ! grep -q '^VERSION=' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; err "Скачанный файл не похож на begleq-cascade — обновление отменено."; return 1
+    fi
+    new_ver=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp" | head -n1)
+
+    # Ставим туда, откуда запущены; при запуске не из файла — в $INSTALL_PATH.
+    target=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
+    [[ -f "$target" && "$target" != "$LIB_BIN" ]] || target=$INSTALL_PATH
+
+    if cmp -s "$tmp" "$target"; then
+        rm -f "$tmp"
+        ok "Уже последняя версия: v$VERSION${sha:+ (${sha:0:7})}"
+        return 0
+    fi
+    # Через mv, а не перезаписью: bash читает скрипт по ходу выполнения,
+    # и правка файла под работающим процессом его ломает. mv подменяет inode.
+    if ! install -m 755 "$tmp" "$target.new" || ! mv -f "$target.new" "$target"; then
+        rm -f "$tmp" "$target.new"; err "Не удалось записать $target"; return 1
+    fi
+    # Копию для юнита обновляем сразу — иначе при ребуте отработает старая.
+    [[ -f "$LIB_BIN" ]] && install -m 755 "$tmp" "$LIB_BIN"
+    rm -f "$tmp"
+    ok "Обновлено: v$VERSION → v$new_ver${sha:+ (${sha:0:7})}"
+    UPDATED_PATH=$target
+}
+
 # --- меню --------------------------------------------------------------------
 
 ask_route() {  # proto
@@ -856,6 +920,7 @@ show_menu() {
         echo -e "7) Применить тюнинг системы (conntrack/BBR)"
         echo -e "8) Восстановить маршруты из базы (sync)"
         echo -e "9) Исключение: не пересылать подключения с IP"
+        echo -e "u) Обновить скрипт"
         echo -e "0) Выход"
         echo "------------------------------------------------------"
         read -r -p "Выбор: " c
@@ -870,6 +935,12 @@ show_menu() {
             7) prepare_system ;;
             8) sync_routes; persist_rules ;;
             9) ask_except ;;
+            u|U) UPDATED_PATH=""; self_update
+                 # Перезапуск уже новой версией (лок освободится при exec).
+                 if [[ -n "$UPDATED_PATH" ]]; then
+                     read -r -p "Enter — перезапустить меню..." _
+                     exec "$UPDATED_PATH"
+                 fi ;;
             0) exit 0 ;;
             *) ;;
         esac
@@ -892,6 +963,7 @@ begleq-cascade v$VERSION — каскад VPN-нод (вход → выход) �
                                                   не пересылать SRC_IP на этом маршруте
   begleq-cascade except add|del SRC_IP            не пересылать SRC_IP ни на одном маршруте
   begleq-cascade sync                             поднять маршруты из базы
+  begleq-cascade update                           обновить скрипт с GitHub
   begleq-cascade tune
 
 Примеры:
@@ -936,6 +1008,7 @@ if (( $# > 0 )); then
                           list|"")    list_routes ;;
                           *)          usage >&2; exit 2 ;;
                       esac ;;
+        update)       self_update ;;
         sync)         sync_routes; [[ "${2:-}" == --boot ]] || persist_rules ;;
         tune)         prepare_system ;;
         *) err "Неизвестная команда: $1"; usage >&2; exit 2 ;;
