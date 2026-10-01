@@ -748,6 +748,45 @@ ask_route() {  # proto
     add_route "$proto" "$in_port" "$tip" "$tport" "$name"
 }
 
+# Исключение из меню: выбираем маршрут по номеру, IP по умолчанию — его выход.
+# Повторный выбор того же маршрута и IP снимает исключение.
+ask_except() {
+    hdr "Исключение из пересылки"
+    msg "Нужно, если на этом сервере стоит маскировочный сайт, а Reality на выходе"
+    msg "берёт его отсюда (target = домен этого сервера). Подключения с IP выхода"
+    msg "пойдут в локальный nginx, а не обратно на выход — иначе петля."
+    msg ""
+    local routes=() line i proto port tip tport name ip
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && routes+=("$line")
+    done < <(cat "$ROUTES_DB" 2>/dev/null)
+    if (( ${#routes[@]} == 0 )); then
+        warn "Маршрутов нет — сначала добавь маршрут (пункт 1 или 2)."
+        return 1
+    fi
+    for i in "${!routes[@]}"; do
+        IFS='|' read -r proto port tip tport name <<< "${routes[i]}"
+        printf "  %d) :%s/%s → %s:%s %s" $((i+1)) "$port" "$proto" "$tip" "$tport" "${name:+[$name]}"
+        grep -q -- "^$proto|$port|" "$EXCEPT_DB" 2>/dev/null \
+            && printf "  ${YELLOW}(исключено: %s)${NC}" \
+                "$(awk -F'|' -v p="$proto" -v d="$port" '$1==p && $2==d {printf "%s ", $3}' "$EXCEPT_DB")"
+        echo
+    done
+    read -r -p "Номер маршрута: " i
+    if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i < 1 || i > ${#routes[@]} )); then
+        err "Нет маршрута с номером '$i'"; return 1
+    fi
+    IFS='|' read -r proto port tip tport name <<< "${routes[i-1]}"
+    read -r -p "IP, который пропускать мимо пересылки [Enter — $tip, выход]: " ip
+    ip=${ip:-$tip}
+    if grep -qxF -- "$proto|$port|$ip" "$EXCEPT_DB" 2>/dev/null; then
+        read -r -p "Исключение для $ip уже есть. Снять его? (y/N): " a
+        [[ "$a" == [yYдД]* ]] && except_del "$proto" "$port" "$ip"
+        return 0
+    fi
+    except_add "$proto" "$port" "$ip"
+}
+
 show_menu() {
     while true; do
         echo ""
@@ -776,10 +815,7 @@ show_menu() {
                if [[ -n "$t" ]]; then read -r -p "Порт выхода: " tp; doctor "$t" "$tp"; else doctor; fi ;;
             7) prepare_system ;;
             8) sync_routes; persist_rules ;;
-            9) read -r -p "Добавить или удалить (a/d): " m
-               read -r -p "Протокол (tcp/udp): " p; read -r -p "Входящий порт: " q
-               read -r -p "IP, который не пересылать (обычно выход): " t
-               if [[ "$m" == d ]]; then except_del "$p" "$q" "$t"; else except_add "$p" "$q" "$t"; fi ;;
+            9) ask_except ;;
             0) exit 0 ;;
             *) ;;
         esac
