@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-VERSION="1.5.1"
+VERSION="1.6.0"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip; *|*|src_ip — все маршруты
@@ -21,6 +21,9 @@ INSTALL_PATH="/usr/local/bin/begleq-cascade"
 LIB_BIN="/usr/local/lib/begleq-cascade/begleq-cascade"   # копия для юнита
 UNIT_NAME="begleq-cascade.service"
 UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
+RPS_SCRIPT="/usr/local/lib/begleq-cascade/rps.sh"
+RPS_UNIT_NAME="begleq-rps.service"
+RPS_UNIT_FILE="/etc/systemd/system/$RPS_UNIT_NAME"
 
 # Метка на всех правилах скрипта: list/del/replace-hop/sync трогают только их.
 TAG="begleq-cascade"
@@ -133,6 +136,9 @@ net.netfilter.nf_conntrack_tcp_timeout_close_wait=30
 
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+
+# Таблица RFS: куда направлять пакеты потока (см. setup_rps).
+net.core.rps_sock_flow_entries=32768
 EOF
     # systemd-sysctl применяет sysctl.d рано, до загрузки nf_conntrack, —
     # ключи net.netfilter.* после ребута молча не применятся. Грузим модули
@@ -234,11 +240,105 @@ persist_rules() {
     fi
 }
 
+# --- RPS/RFS ----------------------------------------------------------------
+# У виртуальной сетевой карты VPS часто одна очередь приёма: все прерывания
+# и весь разбор пакетов (а пересылка DNAT целиком живёт в softirq) идут на
+# одно ядро. Оно упирается в 100%, пока остальные простаивают. RPS раздаёт
+# разбор пакетов по всем ядрам, RFS — направляет поток на ядро его процесса.
+
+# Карты с одной очередью приёма (физические/virtio, без lo, docker, veth…).
+single_queue_ifaces() {
+    local d q
+    for d in /sys/class/net/*; do
+        [[ -e "$d/device" ]] || continue
+        q=("$d"/queues/rx-*)
+        (( ${#q[@]} == 1 )) && [[ -e "${q[0]}" ]] && echo "${d##*/}"
+    done
+}
+
+# Включён ли RPS на интерфейсе (маска не из одних нулей и запятых).
+rps_enabled() {  # iface
+    local m; m=$(cat "/sys/class/net/$1/queues/rx-0/rps_cpus" 2>/dev/null)
+    [[ -n "$m" && "${m//[0,]/}" != "" ]]
+}
+
+# Скрипт для юнита: при загрузке маска считается заново по числу ядер.
+write_rps_script() {
+    mkdir -p "${RPS_SCRIPT%/*}"
+    cat > "$RPS_SCRIPT" <<'EOF'
+#!/bin/bash
+# begleq-cascade: RPS/RFS для сетевых карт с одной очередью приёма.
+n=$(nproc); (( n > 1 )) || exit 0
+# Маска всех ядер группами по 32 бита: младшие ядра — в правой группе.
+mask=""; left=$n
+while (( left > 0 )); do
+    b=$(( left >= 32 ? 32 : left ))
+    g=$(printf '%x' $(( (1 << b) - 1 )))
+    mask=${mask:+$g,$mask}; mask=${mask:-$g}
+    left=$(( left - b ))
+done
+for d in /sys/class/net/*; do
+    [[ -e "$d/device" ]] || continue
+    q=("$d"/queues/rx-*)
+    (( ${#q[@]} == 1 )) && [[ -e "${q[0]}" ]] || continue
+    echo "$mask"  > "${q[0]}/rps_cpus"
+    echo 32768    > "${q[0]}/rps_flow_cnt"
+done
+EOF
+    chmod 755 "$RPS_SCRIPT"
+}
+
+setup_rps() {
+    hdr "Распределение сетевой нагрузки по ядрам (RPS/RFS)"
+    local ifaces; ifaces=$(single_queue_ifaces | tr '\n' ' ')
+    if (( $(nproc) < 2 )); then
+        ok "Одно ядро — распределять нечего"; return 0
+    fi
+    if [[ -z "${ifaces// /}" ]]; then
+        ok "У сетевых карт несколько очередей — распределяет сама карта"; return 0
+    fi
+    write_rps_script
+    "$RPS_SCRIPT" || { warn "Не удалось включить RPS"; return 1; }
+
+    if command -v systemctl >/dev/null 2>&1; then
+        local unit
+        unit=$(cat <<EOF
+[Unit]
+Description=begleq-cascade: RPS/RFS — сетевая нагрузка на все ядра
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$RPS_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+        if [[ "$(cat "$RPS_UNIT_FILE" 2>/dev/null)" != "$unit" ]]; then
+            printf '%s\n' "$unit" > "$RPS_UNIT_FILE"
+            systemctl daemon-reload
+        fi
+        systemctl enable --quiet "$RPS_UNIT_NAME" 2>/dev/null
+        # Ручной rps.service по прежней инструкции больше не нужен.
+        if grep -qs '^Description=Spread network softirq across CPUs (RPS/RFS)$' \
+                /etc/systemd/system/rps.service; then
+            systemctl disable --now --quiet rps.service 2>/dev/null
+            rm -f /etc/systemd/system/rps.service /etc/sysctl.d/99-rps.conf
+            systemctl daemon-reload
+            ok "Ручной rps.service заменён на $RPS_UNIT_NAME"
+        fi
+    fi
+    ok "RPS включён на: ${ifaces% } (ядер: $(nproc), переживёт ребут)"
+}
+
 prepare_system() {
     mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
     touch "$ROUTES_DB"; chmod 600 "$ROUTES_DB"
     install_deps
     apply_sysctl
+    setup_rps
 }
 
 # --- маршруты ----------------------------------------------------------------
@@ -721,6 +821,21 @@ doctor() {
         warn "В /etc/sysctl.conf строка ip_forward закомментирована (после ребута может слететь)"
     fi
 
+    hdr "Сетевые прерывания"
+    local i any=0
+    for i in $(single_queue_ifaces); do
+        any=1
+        if (( $(nproc) < 2 )); then
+            ok "$i: одна очередь, одно ядро — распределять нечего"
+        elif rps_enabled "$i"; then
+            ok "$i: одна очередь, RPS включён ($(cat "/sys/class/net/$i/queues/rx-0/rps_cpus"))"
+        else
+            warn "$i: одна очередь приёма, RPS выключен — вся сетевая нагрузка на одном ядре"
+            msg "  Под нагрузкой это ядро упрётся в 100%. Лечение: begleq-cascade tune"
+        fi
+    done
+    (( any )) || ok "Очередей приёма несколько — нагрузку по ядрам распределяет карта"
+
     hdr "Conntrack"
     local cnt max pct
     cnt=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null)
@@ -929,7 +1044,7 @@ show_menu() {
         echo -e "4) Показать маршруты"
         echo -e "5) ${RED}Удалить маршрут${NC}"
         echo -e "6) ${GREEN}Диагностика (doctor)${NC}"
-        echo -e "7) Применить тюнинг системы (conntrack/BBR)"
+        echo -e "7) Применить тюнинг системы (conntrack/BBR/RPS)"
         echo -e "8) Восстановить маршруты из базы (sync)"
         echo -e "9) Исключение: не пересылать подключения с IP"
         echo -e "u) Обновить скрипт"

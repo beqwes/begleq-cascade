@@ -126,6 +126,11 @@ Nginx на входе должен принимать на `:443` обычный
   established — дефолтные 65 536 и 5 суток переполняют таблицу на релее.
 - Прописывает `nf_conntrack` и `tcp_bbr` в автозагрузку модулей, иначе параметры
   conntrack после ребута не применятся.
+- Если у сетевой карты одна очередь приёма (типично для VPS), включает RPS/RFS:
+  разбор пакетов идёт на всех ядрах, а не на одном. Пересылка DNAT целиком
+  живёт в softirq, и без этого под нагрузкой одно ядро упирается в 100%,
+  пока остальные простаивают. Настройку восстанавливает `begleq-rps.service`.
+  `doctor` предупреждает, если очередь одна, а RPS выключен.
 - Для каждого маршрута ставит DNAT, MASQUERADE только для трафика к выходу
   (через интерфейс, куда реально идёт маршрут) и разрешающие правила `FORWARD`
   в обе стороны — работает и при `policy DROP` от docker или ufw.
@@ -165,3 +170,4 @@ docker, и после ребута они задваиваются. Если `ne
 | `/etc/sysctl.d/99-begleq-cascade.conf` | conntrack, forwarding, BBR |
 | `/etc/modules-load.d/begleq-cascade.conf` | загрузка `nf_conntrack`, `tcp_bbr` при старте |
 | `/etc/modprobe.d/begleq-cascade.conf` | `hashsize` для conntrack |
+| `/etc/systemd/system/begleq-rps.service` | RPS/RFS при загрузке |
