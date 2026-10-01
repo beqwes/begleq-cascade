@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip
