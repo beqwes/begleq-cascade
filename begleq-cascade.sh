@@ -7,10 +7,12 @@
 
 set -o pipefail
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip; *|*|src_ip — все маршруты
+LIMITS_DB="$CONF_DIR/limits.db"          # proto|in_port|down_mbit|up_mbit (0 — без лимита)
+LIMITS_STATE="/run/begleq-cascade.limits" # что сейчас построено в tc (чтобы не пересобирать зря)
 SYSCTL_FILE="/etc/sysctl.d/99-begleq-cascade.conf"
 MODULES_FILE="/etc/modules-load.d/begleq-cascade.conf"
 MODPROBE_FILE="/etc/modprobe.d/begleq-cascade.conf"
@@ -279,7 +281,7 @@ qdisc_not_fq() {  # iface
     command -v tc >/dev/null 2>&1 || return 0
     local root; root=$(tc qdisc show dev "$1" root 2>/dev/null | awk 'NR==1 {print $2}')
     case "$root" in
-        fq|noqueue|"") ;;
+        fq|noqueue|htb|"") ;;   # htb — лимиты скорости маршрутов (limit)
         mq) tc qdisc show dev "$1" 2>/dev/null \
                 | awk '$4=="parent" && $2!="fq" {print "mq: " $2; exit}' ;;
         *)  echo "$root" ;;
@@ -316,7 +318,7 @@ for d in /sys/class/net/*; do
     (( want_fq )) || continue
     root=$(tc qdisc show dev "$i" root 2>/dev/null | awk 'NR==1 {print $2}')
     case "$root" in
-        fq|noqueue|"") ;;
+        fq|noqueue|htb|"") ;;   # htb ставит begleq-cascade limit — не трогаем
         mq)  # многоочередная карта: fq на каждую очередь, mq оставляем
              tc qdisc show dev "$i" | awk '$4=="parent" && $2!="fq" {print $5}' \
                  | while read -r p; do tc qdisc replace dev "$i" parent "$p" fq; done ;;
@@ -612,6 +614,7 @@ add_route() {  # proto in_port target_ip target_port [name]
     flush_conntrack_port "$proto" "$in_port"
     db_add "$proto" "$in_port" "$tip" "$tport" "$name"
     sync_excepts   # исключения «для всех маршрутов» касаются и нового
+    apply_limits   # лимит маршрута привязан к адресу выхода — пересобрать
     persist_rules
     ok "Маршрут поднят: :$in_port/$proto → $tip:$tport"
     msg "${YELLOW}Проверять только С ВНЕШНЕГО хоста${NC} — DNAT живёт в PREROUTING,"
@@ -630,6 +633,7 @@ del_route() {  # proto in_port
     flush_conntrack_port "$proto" "$in_port"
     db_del "$proto" "$in_port"
     except_drop_port "$proto" "$in_port"
+    limit_drop_port "$proto" "$in_port"
     persist_rules
     ok "Маршрут :$in_port/$proto удалён"
 }
@@ -648,7 +652,7 @@ route_excepts() {  # proto in_port
 
 list_routes() {
     hdr "Активные маршруты (из iptables)"
-    local found=0 line proto dport dest name exc foreign orphans
+    local found=0 line proto dport dest name exc lim foreign orphans
     while IFS= read -r line; do
         [[ "$line" == *"-j DNAT"* ]] || continue
         proto=$(dnat_proto "$line"); dport=$(dnat_dport "$line"); dest=$(dnat_dest "$line")
@@ -659,6 +663,8 @@ list_routes() {
         # в локальный сервис. Показываем их под маршрутом.
         exc=$(route_excepts "$proto" "$dport")
         [[ -n "$exc" ]] && printf "          ${YELLOW}кроме подключений с:${NC} %s → идут в локальный сервис\n" "$exc"
+        lim=$(limit_desc "$proto" "$dport")
+        [[ -n "$lim" ]] && printf "          ${YELLOW}лимит скорости:${NC} %s\n" "$lim"
         found=1
     done < <(tagged_rules nat PREROUTING)
     (( found )) || msg "  ${YELLOW}маршрутов нет${NC}"
@@ -916,7 +922,157 @@ sync_routes() {
         warn "Снят маршрут, которого нет в базе: :$in_port/$proto"
     done
     sync_excepts
+    apply_limits
     ok "Маршрутов в работе: $n"
+}
+
+# --- ограничение скорости маршрута (limit) ---------------------------------------
+# Общий лимит на маршрут, отдельно на загрузку (выход → клиент) и отдачу
+# (клиент → выход). Пакеты маршрута относит к классу правило mangle CLASSIFY
+# по conntrack: исходный порт входа + адрес выхода из ответного кортежа +
+# направление. На карте — HTB: классы маршрутов с заданной скоростью (fq_codel
+# внутри, чтобы очередь у потолка не раздувала задержку) и класс по умолчанию
+# без ограничения (fq). Нет лимитов — HTB снимается, карта возвращается на fq.
+# Исключения (выход → локальный nginx) не пересылаются и сюда не попадают.
+
+HTB_DEFAULT="fffe"   # класс по умолчанию; по нему узнаём «свой» HTB
+
+valid_mbit() { [[ "$1" =~ ^[0-9]{1,6}$ ]] && (( 10#$1 <= 100000 )); }
+
+route_dest() {  # proto in_port → "ip port"
+    awk -F'|' -v p="$1" -v d="$2" '$1==p && $2==d {print $3, $4; exit}' "$ROUTES_DB" 2>/dev/null
+}
+
+limit_desc() {  # proto in_port → «↓300 ↑100 Мбит/с» или пусто
+    awk -F'|' -v p="$1" -v d="$2" '$1==p && $2==d {
+        s = ""
+        if ($3 > 0) s = "↓" $3
+        if ($4 > 0) s = s (s == "" ? "" : " ") "↑" $4
+        if (s != "") print s " Мбит/с"
+        exit }' "$LIMITS_DB" 2>/dev/null
+}
+
+# Наш ли HTB на карте (по классу по умолчанию).
+own_htb() {  # iface
+    tc qdisc show dev "$1" root 2>/dev/null | grep -q "^qdisc htb 1: .*default 0x$HTB_DEFAULT"
+}
+
+# Пересобирает правила CLASSIFY и HTB по limits.db. tc пересобирается только
+# если план поменялся (пересборка на миг сбрасывает очередь карты).
+apply_limits() {
+    command -v tc >/dev/null 2>&1 || { [[ -s "$LIMITS_DB" ]] && warn "Нет tc — лимиты скорости не применены"; return 0; }
+    local proto port down up tip tport dif uif n=1 minor line i
+    local plan=() rules=()
+    if [[ -s "$LIMITS_DB" ]]; then
+        while IFS='|' read -r proto port down up; do
+            [[ -n "$proto" ]] && valid_proto "$proto" && valid_port "$port" || continue
+            valid_mbit "$down" && valid_mbit "$up" || continue
+            read -r tip tport < <(route_dest "$proto" "$port")
+            [[ -n "$tip" ]] || continue
+            local m=(-p "$proto" -m conntrack --ctproto "$proto" --ctorigdstport "$port"
+                     --ctreplsrc "$tip" --ctreplsrcport "$tport")
+            if (( 10#$down > 0 )); then
+                dif=$(default_iface); n=$((n+1)); minor=$(printf '%x' "$n")
+                plan+=("$dif|$minor|$((10#$down))")
+                rules+=("${m[*]} --ctdir REPLY -j CLASSIFY --set-class 1:$minor")
+            fi
+            if (( 10#$up > 0 )); then
+                uif=$(route_iface "$tip"); n=$((n+1)); minor=$(printf '%x' "$n")
+                plan+=("$uif|$minor|$((10#$up))")
+                rules+=("${m[*]} --ctdir ORIGINAL -j CLASSIFY --set-class 1:$minor")
+            fi
+        done < "$LIMITS_DB"
+    fi
+
+    # Правила разметки — всегда заново (это мгновенно и ничего не рвёт).
+    del_tagged mangle FORWARD "-j CLASSIFY "
+    for line in "${rules[@]}"; do
+        # shellcheck disable=SC2086
+        iptables -t mangle -A FORWARD ${line% -j *} "${CMT[@]}" -j ${line##* -j }
+    done
+
+    local want; want=$(printf '%s\n' "${plan[@]}")
+    local ifaces; ifaces=$(printf '%s\n' "${plan[@]}" | cut -d'|' -f1 | sort -u | sed '/^$/d')
+    # HTB уже такой, как нужно, — не трогаем.
+    if [[ "$want" == "$(cat "$LIMITS_STATE" 2>/dev/null)" ]]; then
+        local okall=1
+        for i in $ifaces; do own_htb "$i" || okall=0; done
+        (( okall )) && return 0
+    fi
+
+    # Свой HTB с карт, где лимитов больше нет, — снимаем (ядро вернёт
+    # default_qdisc, то есть fq; net.sh дотянет многоочередные карты).
+    local old_ifaces; old_ifaces=$(cut -d'|' -f1 "$LIMITS_STATE" 2>/dev/null)
+    for i in $({ phys_ifaces; printf '%s\n' "$old_ifaces"; } | sed '/^$/d' | sort -u); do
+        own_htb "$i" || continue
+        grep -qx "$i" <<< "$ifaces" && continue
+        tc qdisc del dev "$i" root 2>/dev/null
+        [[ -x "$NET_SCRIPT" ]] && "$NET_SCRIPT"
+    done
+
+    local entry f_if f_minor f_rate burst
+    for i in $ifaces; do
+        tc qdisc del dev "$i" root 2>/dev/null
+        tc qdisc add dev "$i" root handle 1: htb default "$HTB_DEFAULT" 2>/dev/null \
+            || { warn "Не удалось поставить HTB на $i"; continue; }
+        # Класс «всё остальное» без ограничения: большой burst, иначе HTB на
+        # высоких скоростях придерживает пакеты таймером и режет и этот трафик.
+        tc class add dev "$i" parent 1: classid "1:$HTB_DEFAULT" htb \
+            rate 10gbit ceil 10gbit burst 4m cburst 4m 2>/dev/null
+        tc qdisc add dev "$i" parent "1:$HTB_DEFAULT" fq 2>/dev/null \
+            || tc qdisc add dev "$i" parent "1:$HTB_DEFAULT" fq_codel 2>/dev/null
+        for entry in "${plan[@]}"; do
+            IFS='|' read -r f_if f_minor f_rate <<< "$entry"
+            [[ "$f_if" == "$i" ]] || continue
+            # burst на ~10 мс трафика: с маленьким HTB не выходит на заданную скорость.
+            burst=$(( f_rate * 1250 )); (( burst < 15000 )) && burst=15000
+            tc class add dev "$i" parent 1: classid "1:$f_minor" htb \
+                rate "${f_rate}mbit" ceil "${f_rate}mbit" burst "$burst" cburst "$burst" 2>/dev/null
+            tc qdisc add dev "$i" parent "1:$f_minor" fq_codel 2>/dev/null
+        done
+    done
+    printf '%s\n' "${plan[@]}" > "$LIMITS_STATE" 2>/dev/null
+    [[ ${#plan[@]} -gt 0 ]] || rm -f "$LIMITS_STATE"
+}
+
+limit_set() {  # proto in_port down_mbit up_mbit
+    valid_proto "$1" || { err "Протокол должен быть tcp или udp: $1"; return 1; }
+    valid_port  "$2" || { err "Некорректный входящий порт: $2"; return 1; }
+    valid_mbit  "$3" || { err "Загрузка: целое число Мбит/с от 0 до 100000 (0 — без лимита): $3"; return 1; }
+    valid_mbit  "$4" || { err "Отдача: целое число Мбит/с от 0 до 100000 (0 — без лимита): $4"; return 1; }
+    route_exists "$1" "$2" || { err "Маршрута :$2/$1 нет — сначала добавь его"; return 1; }
+    if (( 10#$3 == 0 && 10#$4 == 0 )); then limit_del "$1" "$2"; return; fi
+    command -v tc >/dev/null 2>&1 || { err "Нет tc (пакет iproute2)"; return 1; }
+    mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+    limit_drop_line "$1" "$2"
+    echo "$1|$2|$((10#$3))|$((10#$4))" >> "$LIMITS_DB"; chmod 600 "$LIMITS_DB"
+    apply_limits
+    persist_rules
+    ok "Лимит :$2/$1: $(limit_desc "$1" "$2")"
+    msg "  Действует сразу и на уже открытые соединения; общий на всех клиентов маршрута."
+}
+
+limit_del() {  # proto in_port
+    valid_proto "$1" && valid_port "$2" || { err "Нужно: tcp|udp ПОРТ"; return 1; }
+    if ! grep -q -- "^$1|$2|" "$LIMITS_DB" 2>/dev/null; then
+        warn "Лимита на :$2/$1 нет"; return 1
+    fi
+    limit_drop_line "$1" "$2"
+    apply_limits
+    persist_rules
+    ok "Лимит :$2/$1 снят"
+}
+
+limit_drop_line() {  # proto in_port
+    [[ -f "$LIMITS_DB" ]] || return 0
+    awk -F'|' -v p="$1" -v d="$2" '!($1==p && $2==d)' "$LIMITS_DB" > "$LIMITS_DB.tmp"
+    chmod 600 "$LIMITS_DB.tmp"; mv "$LIMITS_DB.tmp" "$LIMITS_DB"
+}
+
+# Лимит без маршрута бессмыслен — снимается вместе с маршрутом.
+limit_drop_port() {  # proto in_port
+    limit_drop_line "$1" "$2"
+    apply_limits
 }
 
 # --- диагностика -------------------------------------------------------------
@@ -958,6 +1114,20 @@ doctor() {
                 ok "$i: qdisc fq"
             fi
         done
+    fi
+
+    if [[ -s "$LIMITS_DB" ]]; then
+        hdr "Лимиты скорости"
+        local l_proto l_port _
+        while IFS='|' read -r l_proto l_port _; do
+            [[ -n "$l_proto" ]] || continue
+            msg "  :$l_port/$l_proto — $(limit_desc "$l_proto" "$l_port")"
+        done < "$LIMITS_DB"
+        for i in $(cut -d'|' -f1 "$LIMITS_STATE" 2>/dev/null | sort -u); do
+            if own_htb "$i"; then ok "$i: HTB с лимитами на месте"
+            else warn "$i: HTB с лимитами не стоит. Лечение: begleq-cascade sync"; fi
+        done
+        [[ -s "$LIMITS_STATE" ]] || warn "Лимиты в базе есть, но не применены. Лечение: begleq-cascade sync"
     fi
 
     # Много TIME-WAIT к одному адресу — почерк Reality с удалённым target.
@@ -1175,6 +1345,41 @@ ask_except() {
     except_add "$proto" "$port" "$ip"
 }
 
+# Лимит из меню: маршрут по номеру, скорости в Мбит/с (Enter или 0 — без лимита).
+ask_limit() {
+    hdr "Ограничение скорости маршрута"
+    msg "Общий лимит на маршрут — на всех его клиентов вместе. Загрузка — к клиентам,"
+    msg "отдача — от клиентов. Enter или 0 — без ограничения в эту сторону."
+    local routes=() line i proto port tip tport name down up cur
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && routes+=("$line")
+    done < <(cat "$ROUTES_DB" 2>/dev/null)
+    (( ${#routes[@]} )) || { warn "Маршрутов нет — сначала добавь маршрут."; return 1; }
+    for i in "${!routes[@]}"; do
+        IFS='|' read -r proto port tip tport name <<< "${routes[i]}"
+        cur=$(limit_desc "$proto" "$port")
+        printf "  %d) :%s/%s → %s:%s %s%s\n" $((i+1)) "$port" "$proto" "$tip" "$tport" \
+            "${name:+[$name] }" "${cur:+— лимит $cur}"
+    done
+    read -r -p "Номер маршрута: " i
+    if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i < 1 || i > ${#routes[@]} )); then
+        err "Нет маршрута с номером '$i'"; return 1
+    fi
+    IFS='|' read -r proto port tip tport name <<< "${routes[i-1]}"
+    read -r -p "Загрузка (к клиентам), Мбит/с: " down
+    read -r -p "Отдача (от клиентов), Мбит/с: " up
+    down=${down:-0}; up=${up:-0}
+    if ! valid_mbit "$down" || ! valid_mbit "$up"; then
+        err "Скорость — целое число Мбит/с от 0 до 100000"; return 1
+    fi
+    if (( 10#$down == 0 && 10#$up == 0 )); then
+        if grep -q -- "^$proto|$port|" "$LIMITS_DB" 2>/dev/null; then limit_del "$proto" "$port"
+        else ok "Лимит не задан — маршрут без ограничения"; fi
+        return 0
+    fi
+    limit_set "$proto" "$port" "$down" "$up"
+}
+
 show_menu() {
     while true; do
         echo ""
@@ -1190,6 +1395,7 @@ show_menu() {
         echo -e "7) Применить тюнинг системы (conntrack/BBR/RPS)"
         echo -e "8) Восстановить маршруты из базы (sync)"
         echo -e "9) Исключение: не пересылать подключения с IP"
+        echo -e "l) Ограничение скорости маршрута"
         echo -e "u) Обновить скрипт"
         echo -e "0) Выход"
         echo "------------------------------------------------------"
@@ -1207,6 +1413,7 @@ show_menu() {
                [[ "$x" == [yYдД]* ]] && apply_exit_tune ;;
             8) sync_routes; persist_rules ;;
             9) ask_except ;;
+            l|L|д|Д) ask_limit ;;
             u|U) UPDATED_PATH=""; self_update
                  # Перезапуск уже новой версией (лок освободится при exec).
                  if [[ -n "$UPDATED_PATH" ]]; then
@@ -1235,6 +1442,9 @@ begleq-cascade v$VERSION — каскад VPN-нод (вход → выход) �
                                                   не пересылать SRC_IP на этом маршруте
   begleq-cascade except add|del SRC_IP            не пересылать SRC_IP ни на одном маршруте
   begleq-cascade sync                             поднять маршруты из базы
+  begleq-cascade limit set tcp|udp IN_PORT DOWN UP
+                                                  лимит скорости маршрута, Мбит/с (0 — без)
+  begleq-cascade limit del tcp|udp IN_PORT        снять лимит
   begleq-cascade update                           обновить скрипт с GitHub
   begleq-cascade tune [--exit]                    тюнинг системы; --exit — для выходной
                                                   ноды с target Reality на другом сервере
@@ -1278,6 +1488,13 @@ if (( $# > 0 )); then
                                   3) "$fn" "$1" "$2" "$3" ;;
                                   *) usage >&2; exit 2 ;;
                               esac ;;
+                          list|"")    list_routes ;;
+                          *)          usage >&2; exit 2 ;;
+                      esac ;;
+        limit)        shift
+                      case "${1:-}" in
+                          set)        shift; [[ $# -ge 4 ]] || { usage >&2; exit 2; }; limit_set "$1" "$2" "$3" "$4" ;;
+                          del|delete) shift; [[ $# -ge 2 ]] || { usage >&2; exit 2; }; limit_del "$1" "$2" ;;
                           list|"")    list_routes ;;
                           *)          usage >&2; exit 2 ;;
                       esac ;;
