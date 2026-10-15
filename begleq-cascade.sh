@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-VERSION="1.8.0"
+VERSION="1.9.0"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip; *|*|src_ip — все маршруты
@@ -20,6 +20,7 @@ LOCK_FILE="/run/begleq-cascade.lock"
 REPO="beqwes/begleq-cascade"
 BRANCH="master"
 INSTALL_PATH="/usr/local/bin/begleq-cascade"
+SITE_REPO="beqwes/begleq-autorwnode"     # node-setup.sh: сайт-заглушка, сертификат, nginx
 LIB_BIN="/usr/local/lib/begleq-cascade/begleq-cascade"   # копия для юнита
 UNIT_NAME="begleq-cascade.service"
 UNIT_FILE="/etc/systemd/system/$UNIT_NAME"
@@ -1288,6 +1289,80 @@ self_update() {
     UPDATED_PATH=$target
 }
 
+# --- сайт-заглушка (site) -----------------------------------------------------
+# Сайт, сертификат и nginx ставит node-setup.sh из begleq-autorwnode в режиме
+# --site-only: там 30 тем, выпуск и продление Let's Encrypt, nginx в docker.
+# Код не копируем, а берём свежий по SHA последнего коммита — исправления
+# в node-setup приходят сами. Каскаду node-setup не знает только одного:
+# выход должен получать сайт отсюда мимо пересылки, — это делаем здесь.
+#
+# На входе каскада :443 пересылается на выход, поэтому node-setup ставит
+# nginx прямо на :443 (direct-443): сайт видят выход (через исключение)
+# и, через его Reality, все остальные.
+
+# Для маршрутов :443/tcp предлагает исключить выход из пересылки: Reality на
+# выходе с target = домен этого сервера иначе ходит за сайтом по кругу.
+offer_site_excepts() {
+    local proto port tip tport name a
+    while IFS='|' read -r proto port tip tport name; do
+        [[ "$proto" == tcp && "$port" == 443 ]] || continue
+        if grep -qxF -e "tcp|443|$tip" -e "*|*|$tip" "$EXCEPT_DB" 2>/dev/null; then
+            ok "Выход $tip уже исключён из пересылки :443 — сайт отсюда он получит"
+            continue
+        fi
+        msg "  Маршрут :443 → $tip${name:+ [$name]}. Если Reality на $tip берёт сайт"
+        msg "  отсюда (target = домен этого сервера), без исключения будет петля."
+        if [[ -t 0 ]]; then
+            read -r -p "  Исключить $tip из пересылки? (Y/n): " a
+            [[ "$a" == [nNнН]* ]] && continue
+        fi
+        except_add tcp 443 "$tip"
+    done < <(cat "$ROUTES_DB" 2>/dev/null)
+}
+
+site_setup() {  # [аргументы node-setup.sh: --domain D, --site-theme T, --yes …]
+    hdr "Сайт-заглушка (node-setup.sh --site-only из $SITE_REPO)"
+    msg "Ставит nginx (в docker), сертификат Let's Encrypt и сайт-заглушку."
+    msg "Маршруты, ноду Remnawave, ufw и систему не трогает. Домен должен"
+    msg "уже указывать на этот сервер (A-запись), :80 — не пересылаться."
+    msg ""
+    offer_site_excepts
+
+    local sha url dir f allow rc
+    # HEAD — последний коммит основной ветки, как бы она ни называлась (там main).
+    sha=$(fetch "https://api.github.com/repos/$SITE_REPO/commits/HEAD" \
+        "Accept: application/vnd.github.sha" 2>/dev/null)
+    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+        url="https://raw.githubusercontent.com/$SITE_REPO/$sha/node-setup.sh"
+    else
+        warn "GitHub API недоступен — качаю по ветке (может отдать версию из кэша)"
+        url="https://raw.githubusercontent.com/$SITE_REPO/HEAD/node-setup.sh"; sha=""
+    fi
+    dir=$(mktemp -d) || return 1
+    f="$dir/node-setup.sh"
+    if ! fetch "$url" > "$f" || [[ ! -s "$f" ]]; then
+        rm -f "$f"; rmdir "$dir"; err "Не удалось скачать $url"; return 1
+    fi
+    # Проверяем, что это node-setup и что он цел, — до запуска от root.
+    if [[ "$(head -n1 "$f")" != "#!/usr/bin/env bash" ]] || ! grep -q -- '--site-only' "$f" \
+            || ! bash -n "$f" 2>/dev/null; then
+        rm -f "$f"; rmdir "$dir"; err "Скачанный файл не похож на node-setup.sh — отменено"; return 1
+    fi
+    ok "node-setup.sh${sha:+ (${sha:0:7})} скачан, запускаю"
+
+    # Выходы маршрутов — в белый список TrafficGuard: их запросы к сайту
+    # (Reality за target) не должны попадать под бан.
+    allow=$(awk -F'|' 'NF >= 3 && $3 != "" {print $3}' "$ROUTES_DB" 2>/dev/null | sort -u | paste -sd, -)
+    bash "$f" --site-only ${allow:+--tg-allow "$allow"} "$@"
+    rc=$?
+    rm -f "$f"; rmdir "$dir"
+    if (( rc == 0 )) && [[ -s "$ROUTES_DB" ]]; then
+        msg ""
+        msg "  На выходе в Reality: serverNames — домен этого сервера, target — домен:443, xver: 0."
+    fi
+    return $rc
+}
+
 # --- меню --------------------------------------------------------------------
 
 ask_route() {  # proto
@@ -1396,6 +1471,7 @@ show_menu() {
         echo -e "8) Восстановить маршруты из базы (sync)"
         echo -e "9) Исключение: не пересылать подключения с IP"
         echo -e "l) Ограничение скорости маршрута"
+        echo -e "s) Сайт-заглушка и сертификат (как в auto-rwnode)"
         echo -e "u) Обновить скрипт"
         echo -e "0) Выход"
         echo "------------------------------------------------------"
@@ -1414,6 +1490,7 @@ show_menu() {
             8) sync_routes; persist_rules ;;
             9) ask_except ;;
             l|L|д|Д) ask_limit ;;
+            s|S|ы|Ы) site_setup ;;
             u|U) UPDATED_PATH=""; self_update
                  # Перезапуск уже новой версией (лок освободится при exec).
                  if [[ -n "$UPDATED_PATH" ]]; then
@@ -1445,6 +1522,9 @@ begleq-cascade v$VERSION — каскад VPN-нод (вход → выход) �
   begleq-cascade limit set tcp|udp IN_PORT DOWN UP
                                                   лимит скорости маршрута, Мбит/с (0 — без)
   begleq-cascade limit del tcp|udp IN_PORT        снять лимит
+  begleq-cascade site [--domain D] [--site-theme T] [--yes]
+                                                  сайт-заглушка и сертификат (node-setup.sh
+                                                  --site-only из begleq-autorwnode)
   begleq-cascade update                           обновить скрипт с GitHub
   begleq-cascade tune [--exit]                    тюнинг системы; --exit — для выходной
                                                   ноды с target Reality на другом сервере
@@ -1491,6 +1571,7 @@ if (( $# > 0 )); then
                           list|"")    list_routes ;;
                           *)          usage >&2; exit 2 ;;
                       esac ;;
+        site)         shift; site_setup "$@" ;;
         limit)        shift
                       case "${1:-}" in
                           set)        shift; [[ $# -ge 4 ]] || { usage >&2; exit 2; }; limit_set "$1" "$2" "$3" "$4" ;;
