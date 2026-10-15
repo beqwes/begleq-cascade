@@ -155,7 +155,8 @@ begleq-cascade site --domain example.com --yes        # без вопросов
 begleq-cascade site --domain example.com --site-theme kanso
 ```
 
-В меню — пункт `s`. Сайт, сертификат Let's Encrypt (с автопродлением) и nginx
+В меню — пункт `s` (спросит, ставить ли TrafficGuard; из командной строки —
+`--no-traffic-guard`). Сайт, сертификат Let's Encrypt (с автопродлением) и nginx
 ставит `node-setup.sh --site-only` из
 [begleq-autorwnode](https://github.com/beqwes/begleq-autorwnode) — те же темы
 и тот же nginx, что на нодах. Скрипт берётся свежим по SHA последнего коммита

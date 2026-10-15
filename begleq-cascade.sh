@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-VERSION="1.9.0"
+VERSION="1.9.1"
 CONF_DIR="/etc/begleq-cascade"
 ROUTES_DB="$CONF_DIR/routes.db"          # proto|in_port|target_ip|target_port|name
 EXCEPT_DB="$CONF_DIR/except.db"          # proto|in_port|src_ip; *|*|src_ip — все маршруты
@@ -1455,6 +1455,19 @@ ask_limit() {
     limit_set "$proto" "$port" "$down" "$up"
 }
 
+# Сайт из меню: node-setup сам спросит домен, почту и тему; здесь — только
+# то, чего он в --site-only не спрашивает: ставить ли TrafficGuard.
+ask_site() {
+    local a args=()
+    msg ""
+    msg "TrafficGuard блокирует сканеры и госсети (списки в ipset, цепочки INPUT и FORWARD):"
+    msg "на входе каскада отсекает их и от сайта, и от пересылки на выход."
+    msg "IP выходов маршрутов попадут в его белый список сами."
+    read -r -p "Ставить TrafficGuard? (Y/n): " a
+    [[ "$a" == [nNнН]* ]] && args+=(--no-traffic-guard)
+    site_setup "${args[@]}"
+}
+
 show_menu() {
     while true; do
         echo ""
@@ -1490,7 +1503,7 @@ show_menu() {
             8) sync_routes; persist_rules ;;
             9) ask_except ;;
             l|L|д|Д) ask_limit ;;
-            s|S|ы|Ы) site_setup ;;
+            s|S|ы|Ы) ask_site ;;
             u|U) UPDATED_PATH=""; self_update
                  # Перезапуск уже новой версией (лок освободится при exec).
                  if [[ -n "$UPDATED_PATH" ]]; then
